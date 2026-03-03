@@ -1,0 +1,514 @@
+"""Paged KV cache engine for KVCOMM, built on top of nano-vllm's engine.
+
+Reuses nano-vllm's:
+  - BlockManager   → block allocation / deallocation / prefix-caching
+  - Scheduler      → prefill / decode scheduling
+  - ModelRunner     → prepare_prefill / prepare_decode / slot_mapping / block_tables
+  - Attention layer → store_kvcache (triton) + flash_attn_with_kvcache (zero-copy)
+
+Adds KVCOMM-specific:
+  - Anchor storage using block references (instead of full tensor copies)
+  - Block-level KV read/write for delta computation
+  - Multi-agent KV reuse through shared block tables
+
+Architecture overview:
+  ┌─────────────────────────────────────────────────────────┐
+  │                    PagedKVCOMMEngine                    │
+  │                                                         │
+  │  ┌──────────┐   ┌───────────────┐   ┌───────────────┐   │
+  │  │Scheduler │──>│ ModelRunner   │──>│ Model+Attn    │   │
+  │  │          │   │ (slot_mapping │   │ (store_kvcache│   │
+  │  │ allocate │   │  block_tables)│   │  flash_attn)  │   │
+  │  └──────────┘   └───────────────┘   └───────────────┘   │
+  │       │                                    │            │
+  │       v                                    v            │
+  │  ┌──────────┐              ┌────────────────────┐       │
+  │  │  Block   │              │  kv_cache tensor   │       │
+  │  │  Manager │──────────────│[2,L,num_blk,B,H,D] │       │
+  │  │(hash dup)│              └────────────────────┘       │
+  │  └──────────┘                      │                    │
+  │       │                            v                    │
+  │  ┌──────────────────────────────────────────┐           │
+  │  │         KVCOMM Anchor Store              │           │
+  │  │  anchor = {                              │           │
+  │  │    block_table: [b1, b2, b3],  # refs    │           │
+  │  │    num_tokens: 48,                       │           │
+  │  │    ph_key_emb: tensor,   # for sim       │           │
+  │  │    delta_blocks: [d1,d2] # delta KV      │           │
+  │  │  }                                       │           │
+  │  └──────────────────────────────────────────┘           │
+  └─────────────────────────────────────────────────────────┘
+"""
+
+from __future__ import annotations
+
+import threading
+from typing import Any, Dict, List, Optional, Tuple
+
+import torch
+
+# nano-vllm imports
+from nanovllm.engine.block_manager import BlockManager, Block
+from nanovllm.engine.sequence import Sequence
+from nanovllm.layers.attention import store_kvcache
+
+
+class PagedAnchorEntry:
+    """A single anchor stored as block references + lightweight metadata.
+
+    Instead of storing full KV tensor copies (as DynamicCache does),
+    we store:
+      - block_table: list of block IDs in the kv_cache pool → zero-copy reference
+      - num_tokens: how many tokens the anchor covers
+      - ph_key_embedding / ph_value_embedding: small tensors for similarity computation
+      - per-agent delta block tables: block IDs holding the delta KV
+    """
+
+    __slots__ = (
+        "block_table",
+        "num_tokens",
+        "ph_key_embedding",
+        "ph_value_embedding",
+        "agent_deltas",
+    )
+
+    def __init__(
+        self,
+        block_table: List[int],
+        num_tokens: int,
+        ph_key_embedding: torch.Tensor,
+        ph_value_embedding: torch.Tensor,
+    ):
+        self.block_table = block_table
+        self.num_tokens = num_tokens
+        self.ph_key_embedding = ph_key_embedding
+        self.ph_value_embedding = ph_value_embedding
+        # agent_id → {"ph_delta_blocks": [...], "pf_delta_blocks": [...], ...}
+        self.agent_deltas: Dict[str, Dict[str, Any]] = {}
+
+
+class PagedKVCOMMEngine:
+    """Central coordinator for KVCOMM's anchor KV reuse with paged attention.
+
+    This replaces KVCOMMEngine's DynamicCache-based anchor storage with
+    block-table-based storage that references the pre-allocated kv_cache pool.
+
+    The kv_cache pool is the same tensor used by nano-vllm's ModelRunner:
+        kv_cache shape: [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        kv_cache[0] = all key blocks
+        kv_cache[1] = all value blocks
+
+    Reading/writing KV data goes through the same blocks that the model's
+    Attention layer writes to during forward pass → true zero-copy.
+    """
+
+    def __init__(
+        self,
+        kv_cache: torch.Tensor,
+        block_manager: BlockManager,
+        block_size: int,
+        num_layers: int,
+        num_kv_heads: int,
+        head_dim: int,
+    ):
+        """
+        Args:
+            kv_cache: Pre-allocated tensor [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+            block_manager: nano-vllm's BlockManager instance
+            block_size: tokens per block
+            num_layers: number of transformer layers
+            num_kv_heads: number of KV attention heads (after TP split)
+            head_dim: dimension per head
+        """
+        self.kv_cache = kv_cache
+        self.block_manager = block_manager
+        self.block_size = block_size
+        self.num_layers = num_layers
+        self.num_kv_heads = num_kv_heads
+        self.head_dim = head_dim
+
+        # k_cache[layer] = [num_blocks, block_size, num_kv_heads, head_dim]
+        self.k_cache = kv_cache[0]  # [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        self.v_cache = kv_cache[1]
+
+        # Anchor store: ph_id → message → PagedAnchorEntry
+        self.anchors: Dict[str, Dict[str, PagedAnchorEntry]] = {}
+        self._lock = threading.Lock()
+
+    # ─────────────────────── Block-level KV read/write ───────────────────────
+
+    def read_kv_from_blocks(
+        self,
+        block_table: List[int],
+        num_tokens: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Read KV tensors from blocks. Returns [num_layers, num_kv_heads, num_tokens, head_dim].
+
+        This reconstructs continuous tensors from paged blocks.
+        Used for delta computation (set_anchor) and similarity computation (predict_as_anchor).
+        """
+        num_blocks = len(block_table)
+        # Gather blocks: for each layer, collect the relevant blocks
+        # k_cache shape: [num_layers, num_blocks, block_size, num_kv_heads, head_dim]
+        block_ids = torch.tensor(block_table, dtype=torch.long, device=self.kv_cache.device)
+
+        # Index into block pool: [num_layers, len(block_table), block_size, num_kv_heads, head_dim]
+        k_blocks = self.k_cache[:, block_ids]
+        v_blocks = self.v_cache[:, block_ids]
+
+        # Reshape to continuous: [num_layers, total_slots, num_kv_heads, head_dim]
+        k_flat = k_blocks.reshape(self.num_layers, -1, self.num_kv_heads, self.head_dim)
+        v_flat = v_blocks.reshape(self.num_layers, -1, self.num_kv_heads, self.head_dim)
+
+        # Trim to actual num_tokens (last block may be partially filled)
+        k_out = k_flat[:, :num_tokens]  # [num_layers, num_tokens, num_kv_heads, head_dim]
+        v_out = v_flat[:, :num_tokens]
+
+        # Transpose to match KVCOMM's convention: [num_layers, num_kv_heads, num_tokens, head_dim]
+        k_out = k_out.transpose(1, 2)
+        v_out = v_out.transpose(1, 2)
+
+        return k_out, v_out
+
+    def write_kv_to_blocks(
+        self,
+        block_table: List[int],
+        key: torch.Tensor,
+        value: torch.Tensor,
+        num_tokens: int,
+    ) -> None:
+        """Write KV tensors into blocks. key/value: [num_layers, num_kv_heads, num_tokens, head_dim].
+
+        Used to store delta KV or modified KV into pre-allocated blocks.
+        """
+        # Transpose to [num_layers, num_tokens, num_kv_heads, head_dim]
+        key = key.transpose(1, 2).contiguous()
+        value = value.transpose(1, 2).contiguous()
+
+        block_ids = torch.tensor(block_table, dtype=torch.long, device=self.kv_cache.device)
+
+        for layer_idx in range(self.num_layers):
+            # Compute slot_mapping for this write
+            slots = []
+            tokens_left = num_tokens
+            for i, bid in enumerate(block_table):
+                n = min(self.block_size, tokens_left)
+                for j in range(n):
+                    slots.append(bid * self.block_size + j)
+                tokens_left -= n
+
+            slot_mapping = torch.tensor(slots[:num_tokens], dtype=torch.int32, device=key.device)
+
+            # Use nano-vllm's triton kernel
+            store_kvcache(
+                key[layer_idx],      # [num_tokens, num_kv_heads, head_dim]
+                value[layer_idx],
+                self.k_cache[layer_idx],  # [num_blocks, block_size, num_kv_heads, head_dim]
+                self.v_cache[layer_idx],
+                slot_mapping,
+            )
+
+    def allocate_blocks_for_tokens(self, num_tokens: int) -> List[int]:
+        """Allocate fresh blocks from the free pool for a given number of tokens."""
+        num_blocks_needed = (num_tokens + self.block_size - 1) // self.block_size
+        block_ids = []
+        for _ in range(num_blocks_needed):
+            if not self.block_manager.free_block_ids:
+                raise RuntimeError(
+                    f"Not enough free blocks: need {num_blocks_needed}, "
+                    f"have {len(self.block_manager.free_block_ids)}"
+                )
+            bid = self.block_manager.free_block_ids[0]
+            block = self.block_manager._allocate_block(bid)
+            block_ids.append(bid)
+        return block_ids
+
+    def free_blocks(self, block_ids: List[int]) -> None:
+        """Return blocks to the free pool."""
+        for bid in reversed(block_ids):
+            block = self.block_manager.blocks[bid]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self.block_manager._deallocate_block(bid)
+
+    def increment_ref(self, block_ids: List[int]) -> None:
+        """Increment reference count on blocks (for sharing/forking)."""
+        for bid in block_ids:
+            self.block_manager.blocks[bid].ref_count += 1
+
+    # ─────────────────────── Anchor Operations ───────────────────────
+
+    def set_anchor(
+        self,
+        agent_id: str,
+        ph_id: str,
+        message: str,
+        real_block_table: List[int],
+        real_num_tokens: int,
+        base_block_table: List[int],
+        base_num_tokens: int,
+        real_prefix_block_table: List[int],
+        real_prefix_num_tokens: int,
+        base_prefix_block_table: List[int],
+        base_prefix_num_tokens: int,
+    ) -> None:
+        """Store an anchor entry using block references + delta.
+
+        Steps:
+          1. Read base KV from blocks → store embedding for similarity computation
+          2. Read real KV from blocks → compute delta = real - base
+          3. Allocate new blocks for delta → write delta to blocks
+          4. Store block references (not tensors) in anchor entry
+
+        The base's block_table is shared (via ref counting) so multiple agents
+        referencing the same prefix share physical blocks → zero-copy.
+        """
+        # Read base KV for similarity (placeholder portion)
+        base_ph_key, base_ph_val = self.read_kv_from_blocks(base_block_table, base_num_tokens)
+
+        with self._lock:
+            ph_store = self.anchors.setdefault(ph_id, {})
+
+            if message not in ph_store:
+                # New anchor: store base embedding + block reference
+                self.increment_ref(base_block_table)
+                entry = PagedAnchorEntry(
+                    block_table=list(base_block_table),
+                    num_tokens=base_num_tokens,
+                    ph_key_embedding=base_ph_key,
+                    ph_value_embedding=base_ph_val,
+                )
+                ph_store[message] = entry
+            else:
+                entry = ph_store[message]
+
+        # Compute placeholder delta: real - base
+        real_ph_key, real_ph_val = self.read_kv_from_blocks(real_block_table, real_num_tokens)
+        ph_key_delta = real_ph_key - base_ph_key[..., :real_num_tokens, :]
+        ph_val_delta = real_ph_val - base_ph_val[..., :real_num_tokens, :]
+
+        # Allocate blocks for placeholder delta and write
+        ph_delta_blocks = self.allocate_blocks_for_tokens(real_num_tokens)
+        self.write_kv_to_blocks(ph_delta_blocks, ph_key_delta, ph_val_delta, real_num_tokens)
+
+        # Compute prefix delta: real - base
+        real_pf_key, real_pf_val = self.read_kv_from_blocks(
+            real_prefix_block_table, real_prefix_num_tokens
+        )
+        base_pf_key, base_pf_val = self.read_kv_from_blocks(
+            base_prefix_block_table, base_prefix_num_tokens
+        )
+        pf_key_delta = real_pf_key - base_pf_key
+        pf_val_delta = real_pf_val - base_pf_val
+
+        pf_delta_blocks = self.allocate_blocks_for_tokens(real_prefix_num_tokens)
+        self.write_kv_to_blocks(pf_delta_blocks, pf_key_delta, pf_val_delta, real_prefix_num_tokens)
+
+        # Store delta block references for this agent
+        with self._lock:
+            entry.agent_deltas[agent_id] = {
+                "ph_delta_blocks": ph_delta_blocks,
+                "ph_delta_num_tokens": real_num_tokens,
+                "pf_delta_blocks": pf_delta_blocks,
+                "pf_delta_num_tokens": real_prefix_num_tokens,
+            }
+
+    def offset_kv_cache(
+        self,
+        agent_id: str,
+        ph_id: str,
+        message: str,
+        base_ph_block_table: List[int],
+        base_ph_num_tokens: int,
+        base_pf_block_table: List[int],
+        base_pf_num_tokens: int,
+        anchor_list: List[str],
+        temperature: float = 1.0,
+    ) -> Tuple[List[int], int, List[int], int]:
+        """Apply weighted anchor deltas to base KV and write result to new blocks.
+
+        This is the paged equivalent of KVCOMMEngine.offset_kv_cache_pair().
+
+        Returns:
+            (new_ph_block_table, ph_num_tokens, new_pf_block_table, pf_num_tokens)
+        """
+        ph_store = self.anchors.get(ph_id, {})
+        if not ph_store or not anchor_list:
+            # No anchors, return copies of base blocks
+            self.increment_ref(base_ph_block_table)
+            self.increment_ref(base_pf_block_table)
+            return base_ph_block_table, base_ph_num_tokens, base_pf_block_table, base_pf_num_tokens
+
+        # Collect valid anchors
+        valid_anchors = []
+        for msg in anchor_list:
+            entry = ph_store.get(msg)
+            if entry is None:
+                continue
+            if agent_id not in entry.agent_deltas:
+                continue
+            if entry.num_tokens >= base_ph_num_tokens:
+                valid_anchors.append((msg, entry))
+
+        if not valid_anchors:
+            self.increment_ref(base_ph_block_table)
+            self.increment_ref(base_pf_block_table)
+            return base_ph_block_table, base_ph_num_tokens, base_pf_block_table, base_pf_num_tokens
+
+        # Read base KV
+        base_ph_key, base_ph_val = self.read_kv_from_blocks(base_ph_block_table, base_ph_num_tokens)
+        base_pf_key, base_pf_val = self.read_kv_from_blocks(base_pf_block_table, base_pf_num_tokens)
+
+        # Compute similarity weights (same logic as KVCOMMEngine)
+        anchor_ph_keys = torch.stack([
+            e.ph_key_embedding[..., -base_ph_num_tokens:, :] for _, e in valid_anchors
+        ])
+        sims = (base_ph_key.unsqueeze(0) - anchor_ph_keys).norm(2, dim=-2)
+        weights = torch.softmax(-sims.float() / temperature, dim=0).unsqueeze(-2)
+
+        # Weighted sum of deltas (placeholder)
+        ph_delta_sum_k = torch.zeros_like(base_ph_key)
+        ph_delta_sum_v = torch.zeros_like(base_ph_val)
+        for i, (msg, entry) in enumerate(valid_anchors):
+            delta_info = entry.agent_deltas[agent_id]
+            dk, dv = self.read_kv_from_blocks(
+                delta_info["ph_delta_blocks"],
+                min(delta_info["ph_delta_num_tokens"], base_ph_num_tokens),
+            )
+            w = weights[i]
+            ph_delta_sum_k += w * dk[..., :base_ph_num_tokens, :]
+            ph_delta_sum_v += w * dv[..., :base_ph_num_tokens, :]
+
+        # Weighted sum of deltas (prefix)
+        pf_delta_sum_k = torch.zeros_like(base_pf_key)
+        pf_delta_sum_v = torch.zeros_like(base_pf_val)
+        for i, (msg, entry) in enumerate(valid_anchors):
+            delta_info = entry.agent_deltas[agent_id]
+            dk, dv = self.read_kv_from_blocks(
+                delta_info["pf_delta_blocks"],
+                delta_info["pf_delta_num_tokens"],
+            )
+            w = weights[i]
+            pf_delta_sum_k += w * dk
+            pf_delta_sum_v += w * dv
+
+        # Apply delta to base and write to new blocks
+        new_ph_key = base_ph_key + ph_delta_sum_k.to(base_ph_key.dtype)
+        new_ph_val = base_ph_val + ph_delta_sum_v.to(base_ph_val.dtype)
+        new_ph_key[0] = base_ph_key[0]  # Keep layer 0 unchanged (KVCOMM convention)
+        new_ph_val[0] = base_ph_val[0]
+
+        new_ph_blocks = self.allocate_blocks_for_tokens(base_ph_num_tokens)
+        self.write_kv_to_blocks(new_ph_blocks, new_ph_key, new_ph_val, base_ph_num_tokens)
+
+        new_pf_key = base_pf_key + pf_delta_sum_k.to(base_pf_key.dtype)
+        new_pf_val = base_pf_val + pf_delta_sum_v.to(base_pf_val.dtype)
+        new_pf_key[0] = base_pf_key[0]
+        new_pf_val[0] = base_pf_val[0]
+
+        new_pf_blocks = self.allocate_blocks_for_tokens(base_pf_num_tokens)
+        self.write_kv_to_blocks(new_pf_blocks, new_pf_key, new_pf_val, base_pf_num_tokens)
+
+        return new_ph_blocks, base_ph_num_tokens, new_pf_blocks, base_pf_num_tokens
+
+    def predict_as_anchor(
+        self,
+        ph_id: str,
+        candidate_block_table: List[int],
+        candidate_num_tokens: int,
+        anchor_messages: List[str],
+        top_p: float = 0.9,
+        entropy_threshold: float = 0.5,
+    ) -> Tuple[bool, List[int]]:
+        """Decide whether to activate anchors based on KV similarity.
+
+        Same logic as KVCOMMEngine.predict_as_anchor() but reads from blocks.
+
+        Returns:
+            (should_skip, activated_counts)
+        """
+        ph_store = self.anchors.get(ph_id, {})
+        activated = [0] * len(anchor_messages)
+
+        available_indices = []
+        available_entries = []
+        for i, msg in enumerate(anchor_messages):
+            entry = ph_store.get(msg)
+            if entry is not None and entry.num_tokens >= candidate_num_tokens:
+                available_indices.append(i)
+                available_entries.append(entry)
+
+        if len(available_entries) <= 1:
+            return True, activated
+
+        # Read candidate KV
+        _, cand_val = self.read_kv_from_blocks(candidate_block_table, candidate_num_tokens)
+
+        # Read anchor embeddings
+        anchor_vals = torch.stack([
+            e.ph_value_embedding[..., :candidate_num_tokens, :] for e in available_entries
+        ])
+
+        diff = (cand_val.unsqueeze(0) - anchor_vals).norm(2, dim=(1, 2, 3, 4))
+        sim = torch.softmax(-diff.float(), dim=0)
+
+        # Entropy check
+        entropy = -(sim * (sim + 1e-40).log2()).sum()
+        threshold = entropy_threshold * torch.log2(torch.tensor(float(sim.shape[0])))
+        if entropy > threshold:
+            return True, activated
+
+        # Top-p selection
+        sorted_sim, sorted_idx = torch.sort(sim, descending=True)
+        cum = torch.cumsum(sorted_sim, dim=0)
+        cutoff_candidates = (cum < top_p).nonzero(as_tuple=True)[0]
+        cutoff = cutoff_candidates[-1] if len(cutoff_candidates) > 0 else len(sorted_sim) - 1
+        selected = sorted_idx[:cutoff + 1]
+
+        for s in selected:
+            idx = available_indices[s.item()]
+            if idx < len(activated):
+                activated[idx] += 1
+
+        return False, activated
+
+    def get_seq_block_table(self, seq: Sequence) -> List[int]:
+        """Get block table from a nano-vllm Sequence object."""
+        return list(seq.block_table)
+
+    def get_seq_num_tokens(self, seq: Sequence) -> int:
+        """Get number of tokens from a nano-vllm Sequence object."""
+        return len(seq)
+
+    def fork_block_table(self, block_table: List[int]) -> List[int]:
+        """Create a shared copy of a block table (increment ref counts)."""
+        self.increment_ref(block_table)
+        return list(block_table)
+
+    def free_anchor(self, ph_id: str, message: str) -> None:
+        """Free an anchor's blocks."""
+        ph_store = self.anchors.get(ph_id, {})
+        entry = ph_store.pop(message, None)
+        if entry is None:
+            return
+
+        # Free base blocks
+        self.free_blocks(entry.block_table)
+
+        # Free delta blocks for all agents
+        for agent_id, delta_info in entry.agent_deltas.items():
+            self.free_blocks(delta_info.get("ph_delta_blocks", []))
+            self.free_blocks(delta_info.get("pf_delta_blocks", []))
+
+    def get_memory_stats(self) -> Dict[str, int]:
+        """Return memory usage statistics."""
+        total = len(self.block_manager.blocks)
+        free = len(self.block_manager.free_block_ids)
+        used = len(self.block_manager.used_block_ids)
+        return {
+            "total_blocks": total,
+            "free_blocks": free,
+            "used_blocks": used,
+            "block_size": self.block_size,
+            "num_anchors": sum(len(v) for v in self.anchors.values()),
+        }

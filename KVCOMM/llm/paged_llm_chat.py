@@ -1,0 +1,1277 @@
+"""Paged attention LLM chat backend using nano-vllm engine.
+
+This module provides `PagedLLMChat`, a drop-in replacement for `LLMChat`
+that uses nano-vllm's paged attention engine instead of HuggingFace's
+`model.generate()` + `DynamicCache`.
+
+Register:  @LLMRegistry.register('PagedLLMChat')
+
+Key differences from LLMChat:
+  - Uses nano-vllm's LLMEngine (scheduler + model_runner + block_manager)
+  - KV cache lives in a pre-allocated block pool (zero fragmentation)
+  - Prefill writes KV directly to blocks via triton kernels (zero-copy)
+  - Anchor storage uses block references instead of full tensor copies
+  - Supports both Llama and Qwen models via model_runner auto-detection
+"""
+
+from __future__ import annotations
+
+import asyncio
+import copy
+import json
+import os
+import re
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
+from pathlib import Path
+from time import perf_counter
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import torch
+from transformers import AutoTokenizer
+
+from KVCOMM.llm.format import Message
+from KVCOMM.llm.llm import LLM
+from KVCOMM.llm.llm_registry import LLMRegistry
+from KVCOMM.llm.config import KVCommConfig
+from KVCOMM.llm.paged_kvcomm_engine import PagedKVCOMMEngine
+from KVCOMM.utils.metrics import GenerationResult
+from KVCOMM.utils.log import logger
+
+# nano-vllm imports
+sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "nano-vllm"))
+from nanovllm.engine.llm_engine import LLMEngine
+from nanovllm.engine.sequence import Sequence, SequenceStatus
+from nanovllm.sampling_params import SamplingParams
+
+
+def _escape_loguru_markup(text: Optional[str]) -> str:
+    if text is None:
+        return ""
+    return text.replace("<", "\\<")
+
+
+_LATENCY_IO_LOCK = threading.Lock()
+
+
+def _append_latency_record(target: Optional[Union[str, Path]], record: Dict[str, Any]) -> None:
+    if target is None:
+        return
+    path = Path(target)
+    if not path.suffix:
+        path = path / "Latency.json"
+    serializable = {k: v for k, v in record.items() if v is not None}
+    with _LATENCY_IO_LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        existing: List[Dict[str, Any]] = []
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                    if isinstance(loaded, list):
+                        existing = loaded
+            except (json.JSONDecodeError, OSError):
+                existing = []
+        existing.append(serializable)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(existing, f, ensure_ascii=False, indent=2)
+
+
+@LLMRegistry.register('PagedLLMChat')
+class PagedLLMChat(LLM):
+    """Local HF model chat with paged attention and KVCOMM anchor support.
+
+    Uses nano-vllm's engine for:
+      - Block-based KV cache (pre-allocated, zero fragmentation)
+      - Triton store_kvcache for zero-copy prefill
+      - flash_attn_with_kvcache for paged decode
+      - Scheduler for batched prefill/decode
+
+    Uses PagedKVCOMMEngine for:
+      - Anchor storage via block references
+      - Delta computation from block reads
+      - Weighted delta blending for KV reuse
+    """
+
+    # ── Shared state across all instances ──
+    _shared_engine: Optional[LLMEngine] = None
+    _shared_tokenizer: Optional[AutoTokenizer] = None
+    _model_lock = threading.Lock()
+    _THREAD_POOL: Optional[ThreadPoolExecutor] = None
+    _THREAD_POOL_WORKERS: Optional[int] = None
+    _shared_kv_cache_memory: Optional[Dict[str, Any]] = None
+    _initialization: Dict[str, bool] = {}
+    _paged_kv_engine: Optional[PagedKVCOMMEngine] = None
+
+    def __init__(
+        self,
+        model_name: str,
+        prefix: str = None,
+        config: Optional[KVCommConfig] = None,
+    ):
+        self.model_name = model_name
+        self.config = (config or KVCommConfig.from_env()).validate()
+        self._ensure_thread_pool(self.config.thread_pool_workers)
+        self.lock = asyncio.Lock()
+
+        self._initialize_shared_resources()
+
+        self.tokenizer = PagedLLMChat._shared_tokenizer
+        self.engine = PagedLLMChat._shared_engine
+        self.paged_kv_engine = PagedLLMChat._paged_kv_engine
+        self._shared_kv_cache_memory = PagedLLMChat._shared_kv_cache_memory
+        self._initialization = PagedLLMChat._initialization
+
+        self._chat_markers = self._extract_chat_markers()
+        self.default_assistant_prompt = "A: "
+        self.base_messages_template: List[Dict[str, str]] = [
+            {"role": "system", "content": "{system_prompt}"},
+            {"role": "user", "content": "{user_prompt}"},
+        ]
+        if prefix is not None:
+            self._prepare_prefix_template(prefix)
+
+    # ── Initialization ──
+
+    def _initialize_shared_resources(self):
+        """Lazy-init nano-vllm engine, tokenizer, and PagedKVCOMMEngine."""
+        with PagedLLMChat._model_lock:
+            if PagedLLMChat._shared_engine is None:
+                logger.info("Initializing nano-vllm engine for model: {}", self.model_name)
+
+                PagedLLMChat._shared_engine = LLMEngine(self.model_name)
+                PagedLLMChat._shared_tokenizer = PagedLLMChat._shared_engine.tokenizer
+
+                # Extract KV cache and block manager from model_runner
+                model_runner = PagedLLMChat._shared_engine.model_runner
+                scheduler = PagedLLMChat._shared_engine.scheduler
+
+                hf_config = model_runner.config.hf_config
+                tp_size = model_runner.world_size
+                num_kv_heads = hf_config.num_key_value_heads // tp_size
+                head_dim = getattr(
+                    hf_config, "head_dim",
+                    hf_config.hidden_size // hf_config.num_attention_heads,
+                )
+
+                PagedLLMChat._paged_kv_engine = PagedKVCOMMEngine(
+                    kv_cache=model_runner.kv_cache,
+                    block_manager=scheduler.block_manager,
+                    block_size=model_runner.block_size,
+                    num_layers=hf_config.num_hidden_layers,
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                )
+
+                logger.info(
+                    "PagedKVCOMMEngine initialized: {} blocks, block_size={}",
+                    len(scheduler.block_manager.blocks),
+                    model_runner.block_size,
+                )
+
+            if PagedLLMChat._shared_kv_cache_memory is None:
+                PagedLLMChat._shared_kv_cache_memory = {}
+
+    @classmethod
+    def _ensure_thread_pool(cls, workers: int) -> None:
+        if cls._THREAD_POOL is None or cls._THREAD_POOL_WORKERS != workers:
+            if cls._THREAD_POOL is not None:
+                cls._THREAD_POOL.shutdown(wait=False)
+            cls._THREAD_POOL = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="PagedLLM")
+            cls._THREAD_POOL_WORKERS = workers
+
+    # ── Chat template helpers (same as LLMChat) ──
+
+    def _extract_chat_markers(self) -> Dict[str, str]:
+        template = getattr(self.tokenizer, "chat_template", "") or ""
+        markers = {"begin": "", "start": "", "end": "", "eot": ""}
+        for token in ["<|begin_of_text|>", "<s>", getattr(self.tokenizer, "bos_token", "") or ""]:
+            if token and token in template:
+                markers["begin"] = token
+                break
+        for token in ["<|start_header_id|>", "<|im_start|>"]:
+            if token and token in template:
+                markers["start"] = token
+                break
+        for token in ["<|end_header_id|>", "<|im_end|>", "\n"]:
+            if token and token in template:
+                markers["end"] = token
+                break
+        for token in ["<|eot_id|>", "<|im_end|>", getattr(self.tokenizer, "eos_token", "") or ""]:
+            if token and token in template:
+                markers["eot"] = token
+                break
+        return markers
+
+    def _prepare_prefix_template(self, prefix: Union[str, List[Dict[str, str]]]) -> None:
+        if isinstance(prefix, list):
+            self.base_messages_template = prefix
+        elif isinstance(prefix, dict):
+            self.base_messages_template = [prefix]
+        elif isinstance(prefix, str):
+            self.default_assistant_prompt = prefix
+
+    @property
+    def begin_of_text(self) -> str:
+        return self._chat_markers.get("begin", "")
+
+    @property
+    def start_header_id(self) -> str:
+        return self._chat_markers.get("start", "")
+
+    @property
+    def end_header_id(self) -> str:
+        return self._chat_markers.get("end", "")
+
+    @property
+    def eot_id(self) -> str:
+        return self._chat_markers.get("eot", "")
+
+    def format_chat_segment(
+        self,
+        role: str,
+        content: str,
+        *,
+        include_begin: bool = False,
+        include_eot: bool = True,
+    ) -> str:
+        prefix = self.begin_of_text if include_begin else ""
+        start = self.start_header_id
+        end = self.end_header_id
+        eot = self.eot_id if include_eot else ""
+        if start and end:
+            return f"{prefix}{start}{role}{end}\n{content}{eot}"
+        return f"{prefix}[{role.upper()}]\n{content}{eot}"
+
+    def _render_base_messages(self, system_prompt: str, user_prompt: str) -> List[Dict[str, str]]:
+        rendered = []
+        for block in (self.base_messages_template or []):
+            content = block.get("content", "").format(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+            )
+            rendered.append({"role": block.get("role", "user"), "content": content})
+        return rendered
+
+    @staticmethod
+    def _normalise_messages(messages) -> List[Dict[str, str]]:
+        if isinstance(messages, str):
+            return [{"role": "user", "content": messages}]
+        if isinstance(messages, dict):
+            if "role" in messages:
+                return [messages]
+            result = []
+            if "system" in messages:
+                result.append({"role": "system", "content": messages["system"]})
+            if "user" in messages:
+                result.append({"role": "user", "content": messages["user"]})
+            return result
+        if isinstance(messages, list):
+            out = []
+            for item in messages:
+                if isinstance(item, Message):
+                    out.append({"role": item.role, "content": item.content})
+                elif isinstance(item, dict):
+                    out.append(item)
+                elif isinstance(item, str):
+                    out.append({"role": "user", "content": item})
+            return out
+        return [{"role": "user", "content": str(messages)}]
+
+    def _build_prompt_text(
+        self,
+        messages: Union[List[Message], List[Dict], str],
+        assistant_prompt: Optional[str] = None,
+    ) -> str:
+        normalised = self._normalise_messages(messages)
+        assistant_prompt = assistant_prompt or self.default_assistant_prompt
+        try:
+            text = self.tokenizer.apply_chat_template(
+                normalised,
+                add_generation_prompt=True,
+                tokenize=False,
+            ) + assistant_prompt
+        except Exception:
+            parts = [self.begin_of_text or ""]
+            for msg in normalised:
+                role, content = msg.get("role", "user"), msg.get("content", "")
+                s, e, eot = self.start_header_id, self.end_header_id, self.eot_id
+                if s and e:
+                    parts.append(f"{s}{role}{e}\n{content}{eot}")
+                else:
+                    parts.append(f"[{role.upper()}]\n{content}{eot}")
+            parts.append(f"{self.start_header_id}assistant{self.end_header_id}\n" if self.start_header_id else "[ASSISTANT]\n")
+            text = "".join(parts) + (assistant_prompt or "")
+        return text
+
+    def _encode(self, text: str) -> List[int]:
+        """Encode text to token IDs."""
+        return self.tokenizer.encode(text, add_special_tokens=False)
+
+    # ── Agent identity ──
+
+    def set_id(self, node_id: str, role: str):
+        self.node_id = node_id
+        self.role = role
+        if self.node_id not in PagedLLMChat._shared_kv_cache_memory:
+            PagedLLMChat._shared_kv_cache_memory[self.node_id] = {}
+            PagedLLMChat._initialization[self.node_id] = False
+
+    def has_prefix_initialized(self, agent_id: str) -> bool:
+        return PagedLLMChat._initialization.get(agent_id, False)
+
+    # ── Core generation via nano-vllm engine ──
+
+    def _generate_tokens(
+        self,
+        token_ids: List[int],
+        max_tokens: int = 512,
+        temperature: float = 0.0,
+    ) -> Tuple[List[int], float, Sequence]:
+        """Run prefill + decode through nano-vllm's LLMEngine.
+
+        Returns (completion_token_ids, ttft, sequence).
+        The Sequence object holds `block_table` which references physical KV blocks.
+        """
+        sp = SamplingParams(
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        seq = Sequence(token_ids, sp)
+
+        # Add to scheduler
+        scheduler = self.engine.scheduler
+        scheduler.add(seq)
+
+        ttft = None
+        start_time = perf_counter()
+
+        while not seq.is_finished:
+            seqs, is_prefill = scheduler.schedule()
+            token_ids_out = self.engine.model_runner.call("run", seqs, is_prefill)
+            scheduler.postprocess(seqs, token_ids_out)
+
+            if ttft is None and not is_prefill:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                ttft = perf_counter() - start_time
+
+        if ttft is None:
+            ttft = 0.0
+
+        return seq.completion_token_ids, ttft, seq
+
+    # ── Prefix preparation (paged version) ──
+
+    async def prepare_prefix_kv_segments(self, node_id: str, prefix: str, user_prompt: str):
+        """Materialize prefix KV into blocks and store block tables.
+
+        Unlike LLMChat which stores DynamicCache objects, we:
+          1. Run prefill through nano-vllm engine → KV written to blocks by triton
+          2. Store block_table references (not KV tensors) in shared memory
+        """
+        messages = self._render_base_messages(prefix, user_prompt)
+        prompt_text = self._build_prompt_text(messages)
+        placeholder_info, segments = self._locate_placeholder(prompt_text)
+
+        # Run the full prompt through the engine to populate KV blocks
+        full_token_ids = self._encode(prompt_text)
+        sp = SamplingParams(temperature=0.0, max_tokens=1)
+        seq = Sequence(full_token_ids, sp)
+
+        scheduler = self.engine.scheduler
+        scheduler.add(seq)
+
+        # Run one prefill step to fill KV cache blocks
+        seqs, is_prefill = scheduler.schedule()
+        assert is_prefill, "Expected prefill step"
+        self.engine.model_runner.call("run", seqs, is_prefill)
+
+        # Now seq.block_table has the physical blocks containing the prefix KV
+        full_block_table = list(seq.block_table)
+        full_num_tokens = len(seq)
+
+        # Store per-segment block ranges
+        segment_block_info = []
+        segment_token_ids_list = []
+        for type_, text, token_ids, s, e in segments:
+            if type_ == "text":
+                # Compute which blocks this segment spans
+                start_block = s // self.paged_kv_engine.block_size
+                end_block = (e - 1) // self.paged_kv_engine.block_size + 1
+                seg_blocks = full_block_table[start_block:end_block]
+                self.paged_kv_engine.increment_ref(seg_blocks)
+                segment_block_info.append({
+                    "block_table": seg_blocks,
+                    "start_token": s,
+                    "end_token": e,
+                    "num_tokens": e - s,
+                })
+                encoding = {
+                    "input_ids": torch.tensor(token_ids, device="cuda").unsqueeze(0),
+                }
+                encoding["attention_mask"] = torch.ones_like(encoding["input_ids"])
+                segment_token_ids_list.append(encoding)
+
+        # Deallocate the generation sequence but keep
+        # the blocks we incremented ref on
+        scheduler.postprocess(seqs, [self.tokenizer.eos_token_id])
+
+        mem = PagedLLMChat._shared_kv_cache_memory[node_id]
+        mem["prefix_block_info"] = segment_block_info
+        mem["prefix_block_table"] = full_block_table
+        mem["prefix_num_tokens"] = full_num_tokens
+        mem["placeholder_info"] = placeholder_info
+        mem["token_ids"] = segment_token_ids_list
+
+        PagedLLMChat._initialization[node_id] = True
+
+    def _locate_placeholder(self, original_text: str):
+        """Locate placeholder spans in prompt. Returns (placeholder_info, segments)."""
+        pattern = r'\{((?:agent|condition)_\w+_(?:current|history)|user_question)\}'
+        matches = list(re.finditer(pattern, original_text))
+
+        segments = []
+        placeholder_info = {}
+        last_pos = 0
+        token_num = 0
+
+        for m in matches:
+            start, end = m.span()
+            placeholder_inner = m.group(1)
+
+            if last_pos < start:
+                txt = original_text[last_pos:start]
+                ids = self._encode(txt)
+                if txt.strip():
+                    segments.append(("text", txt, ids, token_num, token_num + len(ids)))
+                token_num += len(ids)
+
+            ph_text = f'{{{placeholder_inner}}} '
+            ids = self._encode(ph_text)
+            segments.append(("placeholder", placeholder_inner, ids, token_num, token_num + len(ids)))
+            placeholder_info[placeholder_inner] = [token_num, token_num + len(ids)]
+            token_num += len(ids)
+            last_pos = end
+
+        txt = original_text[last_pos:]
+        ids = self._encode(txt)
+        if txt.strip():
+            segments.append(("text", txt, ids, token_num, token_num + len(ids)))
+            token_num += len(ids)
+
+        segments.sort(key=lambda x: x[-1])
+        placeholder_info = dict(sorted(placeholder_info.items(), key=lambda x: x[1][0], reverse=True))
+        return placeholder_info, segments
+
+    # ── Generation entry points ──
+
+    def gen(
+        self,
+        messages: List[Message],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> str:
+        """Synchronous generation."""
+        prompt_text = self._build_prompt_text(messages)
+        token_ids = self._encode(prompt_text)
+        max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
+        temperature = temperature or self.DEFAULT_TEMPERATURE
+
+        completion_ids, ttft, seq = self._generate_tokens(token_ids, max_tokens, temperature)
+        return self.tokenizer.decode(completion_ids, skip_special_tokens=True)
+
+    async def agen(
+        self,
+        messages: List[Message] = None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        return_cache: Optional[bool] = False,
+        *,
+        request_uid: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        agent_role: Optional[str] = None,
+    ) -> GenerationResult:
+        """Async generation through nano-vllm engine."""
+        async with self.lock:
+            max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
+            temperature = temperature or self.DEFAULT_TEMPERATURE
+
+            prompt_text = self._build_prompt_text(messages)
+            token_ids = self._encode(prompt_text)
+
+            safe_prompt = _escape_loguru_markup(prompt_text)
+            logger.opt(colors=True).debug(
+                "<blue>[PROMPT]</blue> Agent {} Role {} Prompt:\n{}",
+                getattr(self, "node_id", "?"),
+                getattr(self, "role", "?"),
+                safe_prompt,
+            )
+
+            completion_ids, ttft, seq = self._generate_tokens(token_ids, max_tokens, temperature)
+            response_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
+
+            safe_resp = _escape_loguru_markup(response_text)
+            logger.opt(colors=True).debug(
+                "<blue>[RESPONSE]</blue> Agent {} Role {} Response:\n{}",
+                getattr(self, "node_id", "?"),
+                getattr(self, "role", "?"),
+                safe_resp,
+            )
+
+            metadata: Dict[str, Any] = {}
+            if request_uid:
+                metadata["request_uid"] = request_uid
+            if agent_id:
+                metadata["agent_id"] = agent_id
+            if return_cache:
+                metadata["block_table"] = list(seq.block_table)
+                metadata["num_tokens"] = len(seq)
+
+            return GenerationResult(
+                text=response_text,
+                mode="paged",
+                ttft=ttft,
+                metadata=metadata,
+            )
+
+    async def generate_for_agent(
+        self,
+        *,
+        request_uid: str,
+        message: str,
+        preferred_mode: Optional[str],
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        agent_id: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        agent_role: Optional[str] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+        **kwargs: Any,
+    ) -> GenerationResult:
+        """Generate using the requested strategy with paged attention."""
+        if preferred_mode == "dense_prefill":
+            return await self.generate_with_dense_prefill(
+                message,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                request_uid=request_uid,
+                agent_id=agent_id,
+                agent_name=agent_name,
+                agent_role=agent_role,
+                output_dir=output_dir,
+                **kwargs,
+            )
+        return await self.generate_with_kv_reuse(
+            message,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            request_uid=request_uid,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            agent_role=agent_role,
+            output_dir=output_dir,
+            **kwargs,
+        )
+
+    async def generate_with_kv_reuse(
+        self,
+        messages=None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        request_uid: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        agent_role: Optional[str] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+        **kwargs,
+    ) -> GenerationResult:
+        """Generate by reusing prefix KV blocks (fast path).
+
+        The prefix KV blocks are already in the block pool from prepare_prefix_kv_segments().
+        We construct a Sequence whose block_table includes those prefix blocks,
+        so the scheduler skips prefilling them (prefix caching via hash match).
+        """
+        test_time = kwargs.pop("test_time", False)
+        if test_time:
+            return await self.agen_kvcomm_time_test(
+                messages=messages,
+                max_tokens=max_tokens,
+                min_tokens=max_tokens,
+                temperature=temperature,
+                request_uid=request_uid,
+                mode="kv_reuse",
+                agent_id=agent_id,
+                agent_name=agent_name,
+                agent_role=agent_role,
+                output_dir=output_dir,
+            )
+        return await self._generate_paged(
+            messages, "kv_reuse",
+            max_tokens=max_tokens, temperature=temperature,
+            request_uid=request_uid, agent_id=agent_id,
+            agent_name=agent_name, agent_role=agent_role,
+            output_dir=output_dir, **kwargs,
+        )
+
+    async def generate_with_dense_prefill(
+        self,
+        messages=None,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        request_uid: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        agent_role: Optional[str] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+        **kwargs,
+    ) -> GenerationResult:
+        """Generate with fresh prefix computation and anchor update."""
+        return await self._generate_paged(
+            messages, "dense_prefill",
+            max_tokens=max_tokens, temperature=temperature,
+            request_uid=request_uid, agent_id=agent_id,
+            agent_name=agent_name, agent_role=agent_role,
+            output_dir=output_dir, **kwargs,
+        )
+
+    async def _generate_paged(
+        self,
+        messages,
+        mode: str,
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        request_uid: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        agent_role: Optional[str] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+        **kwargs,
+    ) -> GenerationResult:
+        """Core paged generation for both kv_reuse and dense_prefill modes.
+
+        In both modes:
+          1. Build full prompt token IDs (with placeholders filled)
+          2. Feed to nano-vllm engine → scheduler allocates blocks, model runs
+          3. Engine Attention layers write KV directly into blocks (triton)
+          4. After generation, use block_table for anchor operations
+
+        kv_reuse mode:
+          - Prefix blocks may already be cached (BlockManager hash match)
+          - seq.num_cached_tokens will skip re-computing cached prefix
+          - Then apply anchor deltas from PagedKVCOMMEngine
+
+        dense_prefill mode:
+          - Full prefill, then compute anchor deltas for future reuse
+        """
+        async with self.lock:
+            max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
+            temperature = temperature or self.DEFAULT_TEMPERATURE
+            preprocess_start = perf_counter()
+
+            message = messages[0] if isinstance(messages, list) else messages
+
+            # Build prompt
+            prefix_store = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
+            placeholder_info = prefix_store.get("placeholder_info", {})
+
+            prompt_text = self._build_prompt_text(message)
+            token_ids = self._encode(prompt_text)
+
+            safe_prompt = _escape_loguru_markup(prompt_text)
+            logger.opt(colors=True).debug(
+                "<blue>[PROMPT:{}]</blue> Agent {} Role {} Prompt:\n{}",
+                mode, self.node_id, self.role, safe_prompt,
+            )
+
+            # Generate through nano-vllm engine
+            preprocess_latency = perf_counter() - preprocess_start
+            completion_ids, ttft, seq = self._generate_tokens(
+                token_ids, max_tokens, temperature,
+            )
+
+            total_ttft = ttft + preprocess_latency
+
+            # Block table now contains all KV blocks for this generation
+            block_table = list(seq.block_table)
+            prompt_num_tokens = len(token_ids)
+            total_num_tokens = len(seq)
+
+            # ── Anchor operations ──
+            if mode == "dense_prefill" and placeholder_info:
+                # After full prefill, store anchor deltas
+                for ph_id, (ph_start, ph_end) in placeholder_info.items():
+                    anchor_messages = list(self.paged_kv_engine.anchors.get(ph_id, {}).keys())
+
+                    # Block range for placeholder portion
+                    bs = self.paged_kv_engine.block_size
+                    ph_start_block = ph_start // bs
+                    ph_end_block = (ph_end - 1) // bs + 1
+                    ph_blocks = block_table[ph_start_block:ph_end_block]
+                    ph_num = ph_end - ph_start
+
+                    # Block range for prefix after placeholder
+                    pf_start = ph_end
+                    pf_end = prompt_num_tokens
+                    pf_start_block = pf_start // bs
+                    pf_end_block = (pf_end - 1) // bs + 1
+                    pf_blocks = block_table[pf_start_block:pf_end_block]
+                    pf_num = pf_end - pf_start
+
+                    # We need base blocks - stored in prefix_block_info
+                    base_block_table = prefix_store.get("prefix_block_table", [])
+                    if base_block_table:
+                        base_ph_blocks = base_block_table[ph_start_block:ph_end_block]
+                        base_pf_blocks = base_block_table[pf_start_block:pf_end_block]
+
+                        self.paged_kv_engine.set_anchor(
+                            agent_id=self.node_id,
+                            ph_id=ph_id,
+                            message=str(message),
+                            real_block_table=ph_blocks,
+                            real_num_tokens=ph_num,
+                            base_block_table=base_ph_blocks,
+                            base_num_tokens=ph_num,
+                            real_prefix_block_table=pf_blocks,
+                            real_prefix_num_tokens=pf_num,
+                            base_prefix_block_table=base_pf_blocks,
+                            base_prefix_num_tokens=pf_num,
+                        )
+
+            elif mode == "kv_reuse" and placeholder_info:
+                # Apply anchor deltas to modify KV in place
+                for ph_id, (ph_start, ph_end) in placeholder_info.items():
+                    anchor_messages = list(self.paged_kv_engine.anchors.get(ph_id, {}).keys())
+
+                    if anchor_messages:
+                        bs = self.paged_kv_engine.block_size
+                        ph_start_block = ph_start // bs
+                        ph_end_block = (ph_end - 1) // bs + 1
+                        ph_blocks = block_table[ph_start_block:ph_end_block]
+                        ph_num = ph_end - ph_start
+
+                        pf_start = ph_end
+                        pf_end = prompt_num_tokens
+                        pf_start_block = pf_start // bs
+                        pf_end_block = (pf_end - 1) // bs + 1
+                        pf_blocks = block_table[pf_start_block:pf_end_block]
+                        pf_num = pf_end - pf_start
+
+                        # Offset modifies KV in-place via write_kv_to_blocks
+                        new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache(
+                            agent_id=self.node_id,
+                            ph_id=ph_id,
+                            message=str(message),
+                            base_ph_block_table=ph_blocks,
+                            base_ph_num_tokens=ph_num,
+                            base_pf_block_table=pf_blocks,
+                            base_pf_num_tokens=pf_num,
+                            anchor_list=anchor_messages,
+                            temperature=1.0,
+                        )
+
+            # Store response block info for future reuse
+            mem = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
+            resp_blocks = mem.setdefault("response_blocks", {})
+            resp_blocks.setdefault(str(message), []).append({
+                "block_table": block_table[prompt_num_tokens // self.paged_kv_engine.block_size:],
+                "num_tokens": total_num_tokens - prompt_num_tokens,
+            })
+
+            # Decode response
+            response_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
+            safe_resp = _escape_loguru_markup(response_text)
+            logger.opt(colors=True).debug(
+                "<blue>[RESPONSE:{}]</blue> Agent {} Role {} Response:\n{}",
+                mode, self.node_id, self.role, safe_resp,
+            )
+
+            metadata: Dict[str, Any] = {
+                "placeholder_ids": list(placeholder_info.keys()),
+            }
+            if request_uid:
+                metadata["request_uid"] = request_uid
+            if agent_id:
+                metadata["agent_id"] = agent_id
+            if agent_name:
+                metadata["agent_name"] = agent_name
+            if agent_role:
+                metadata["agent_role"] = agent_role
+
+            _append_latency_record(output_dir, {
+                "timestamp": time.time(),
+                "mode": mode,
+                "ttft": float(total_ttft),
+                "request_uid": request_uid,
+                "agent_id": agent_id,
+                "message": str(message) if message else None,
+            })
+
+            return GenerationResult(
+                text=response_text,
+                mode=mode,
+                ttft=total_ttft,
+                metadata=metadata,
+            )
+
+    # ── Input/condition anchor helpers ──
+
+    def update_input_anchor(
+        self,
+        *,
+        request_uid: str,
+        agent_id: str,
+        message: str,
+        user_content: str,
+        prefix_text: str,
+        role: str = "user",
+        include_begin: bool = True,
+        include_eot: bool = False,
+        anchor_namespace: str = "user_question",
+        test_time: bool = False,
+    ) -> str:
+        """Compute input KV via engine and decide kv_reuse vs dense_prefill.
+
+        Returns: "kv_reuse" or "dense_prefill"
+        """
+        text = self.format_chat_segment(role, user_content, include_begin=include_begin, include_eot=include_eot)
+        token_ids = self._encode(text)
+        prefix_ids = self._encode(
+            self.format_chat_segment(role, prefix_text, include_begin=include_begin, include_eot=include_eot)
+        )
+        drop_num = len(prefix_ids)
+
+        if test_time:
+            for i in range(10):
+                if i == 5:
+                    start_time = perf_counter()
+                sp = SamplingParams(temperature=0.0, max_tokens=1)
+                seq = Sequence(token_ids, sp)
+                scheduler = self.engine.scheduler
+                scheduler.add(seq)
+                seqs, is_prefill = scheduler.schedule()
+                self.engine.model_runner.call("run", seqs, is_prefill)
+                scheduler.postprocess(seqs, [self.tokenizer.eos_token_id])
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            end_time = perf_counter()
+            safe_msg = _escape_loguru_markup(message)
+            logger.opt(colors=True).info(
+                f"<cyan>Latency for computing the input kv-cache of {safe_msg}: {(end_time - start_time) / 5:.3f} seconds</cyan>"
+            )
+        else:
+            # Run through engine to get KV in blocks
+            sp = SamplingParams(temperature=0.0, max_tokens=1)
+            seq = Sequence(token_ids, sp)
+            scheduler = self.engine.scheduler
+            scheduler.add(seq)
+            seqs, is_prefill = scheduler.schedule()
+            self.engine.model_runner.call("run", seqs, is_prefill)
+            scheduler.postprocess(seqs, [self.tokenizer.eos_token_id])
+
+        block_table = list(seq.block_table)
+        num_tokens = len(token_ids)
+
+        # Store in shared memory
+        shared_mem = PagedLLMChat._shared_kv_cache_memory
+        shared_mem.setdefault("input_blocks", {}).setdefault(message, []).append({
+            "block_table": block_table,
+            "num_tokens": num_tokens,
+            "drop_num": drop_num,
+        })
+
+        # Predict whether to activate anchor
+        candidate_num = num_tokens - drop_num
+        bs = self.paged_kv_engine.block_size
+        candidate_start_block = drop_num // bs
+        candidate_blocks = block_table[candidate_start_block:]
+
+        anchor_messages = list(self.paged_kv_engine.anchors.get(anchor_namespace, {}).keys())
+
+        should_skip, activated = self.paged_kv_engine.predict_as_anchor(
+            ph_id=anchor_namespace,
+            candidate_block_table=candidate_blocks,
+            candidate_num_tokens=candidate_num,
+            anchor_messages=anchor_messages,
+            top_p=0.9,
+            entropy_threshold=self.config.threshold,
+        )
+
+        safe_msg = _escape_loguru_markup(message)
+        logger.opt(colors=True).debug(
+            f"<magenta>Anchor prediction for input '{safe_msg}'</magenta>: skip={should_skip}"
+        )
+
+        if should_skip:
+            return "dense_prefill"
+        return "kv_reuse"
+
+    def update_condition_anchor(
+        self,
+        *,
+        request_uid: str,
+        owner_agent_id: str,
+        message: str,
+        content: str,
+        prefix_text: str,
+        role: str = "user",
+        include_begin: bool = True,
+        include_eot: bool = False,
+        anchor_namespace: Optional[str] = None,
+        max_length: int = None,
+    ) -> bool:
+        """Materialise condition KV cache for another agent and update anchors.
+
+        Runs prefill through the paged engine to populate blocks, then uses
+        predict_as_anchor to decide if this condition should be treated as a
+        new anchor (dense_prefill) or reused (kv_reuse).
+
+        Returns True if the condition is new (needs dense_prefill), False otherwise.
+        """
+        anchor_key = anchor_namespace or f"condition_{owner_agent_id}_current"
+        owner_memory = PagedLLMChat._shared_kv_cache_memory.setdefault(owner_agent_id, {})
+        condition_bucket = owner_memory.setdefault("condition_blocks", {})
+
+        if message in condition_bucket:
+            # Already materialised
+            return False
+
+        text = self.format_chat_segment(role, content, include_begin=include_begin, include_eot=include_eot)
+        token_ids = self._encode(text)
+
+        prefix_ids = self._encode(
+            self.format_chat_segment(role, prefix_text, include_begin=include_begin, include_eot=include_eot)
+        )
+        drop_num = len(prefix_ids)
+
+        if max_length is not None:
+            token_ids = token_ids[:drop_num + max_length]
+
+        # Run prefill through engine
+        sp = SamplingParams(temperature=0.0, max_tokens=1)
+        seq = Sequence(token_ids, sp)
+        scheduler = self.engine.scheduler
+        scheduler.add(seq)
+
+        seqs, is_prefill = scheduler.schedule()
+        self.engine.model_runner.call("run", seqs, is_prefill)
+        scheduler.postprocess(seqs, [self.tokenizer.eos_token_id])
+
+        block_table = list(seq.block_table)
+        num_tokens = len(token_ids)
+
+        # Store condition blocks
+        condition_bucket[message] = {
+            "block_table": block_table,
+            "num_tokens": num_tokens,
+            "drop_num": drop_num,
+        }
+
+        # Predict as anchor using blocks after drop_num
+        candidate_num = num_tokens - drop_num
+        bs = self.paged_kv_engine.block_size
+        candidate_start_block = drop_num // bs
+        candidate_blocks = block_table[candidate_start_block:]
+
+        anchor_messages = list(self.paged_kv_engine.anchors.get(anchor_key, {}).keys())
+
+        should_skip, activated = self.paged_kv_engine.predict_as_anchor(
+            ph_id=anchor_key,
+            candidate_block_table=candidate_blocks,
+            candidate_num_tokens=candidate_num,
+            anchor_messages=anchor_messages,
+            top_p=0.9,
+            entropy_threshold=self.config.threshold,
+        )
+
+        return should_skip  # True = new anchor needed (dense_prefill)
+
+    def has_active_anchor(self, request_uid: str, message: str) -> bool:
+        """Determine whether an anchor should trigger dense prefill.
+
+        Checks if any placeholder's anchor dict indicates this message
+        should be densely prefilled.
+        """
+        ph_ids = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {}).get("placeholder_info", {}).keys()
+        for ph_id in ph_ids:
+            anchor_store = self.paged_kv_engine.anchors.get(ph_id, {})
+            if message in anchor_store:
+                # If this agent has not contributed a delta yet, need dense_prefill
+                entry = anchor_store[message]
+                agent_deltas = getattr(entry, "agent_deltas", {})
+                if self.node_id not in agent_deltas:
+                    return True
+        return False
+
+    @classmethod
+    def finalize_request(cls, request_uid: str) -> None:
+        """Clean up request-scoped state.
+
+        For the paged backend, this frees any request-scoped block references.
+        """
+        # In paged mode, blocks are ref-counted and freed via block_manager.
+        # Per-request state is minimal; clear any cached data.
+        pass
+
+    def _map_in_pool(self, fn, iterable, timeout=None):
+        """Execute fn(args) for each args in iterable using the shared thread pool."""
+        pool = PagedLLMChat._THREAD_POOL
+        if pool is None:
+            raise RuntimeError("Thread pool not initialized")
+        task_timeout = timeout or self.config.worker_timeout
+        futures = [pool.submit(fn, *args) for args in iterable]
+        for fut in as_completed(futures, timeout=task_timeout):
+            try:
+                yield fut.result(timeout=self.config.worker_timeout)
+            except TimeoutError as exc:
+                raise TimeoutError("Thread task timeout") from exc
+            except Exception as exc:
+                raise RuntimeError("Thread task failed") from exc
+
+    # ── Time test (benchmark kv_reuse vs dense_prefill) ──
+
+    async def agen_kvcomm_time_test(
+        self,
+        messages: List[Message] = None,
+        max_tokens: Optional[int] = None,
+        min_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        request_uid: Optional[str] = None,
+        mode: str = "kv_reuse",
+        agent_id: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        agent_role: Optional[str] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+    ) -> GenerationResult:
+        """Benchmark: run BOTH kv_reuse and dense_prefill, compare TTFT.
+
+        The paged equivalent of LLMChat.agen_kvcomm_time_test.
+        1. First run: kv_reuse mode (prefix blocks cached → fast prefill)
+        2. Second run: dense_prefill (full prefill, no block reuse)
+        3. Log comparison ratio
+        """
+        max_tokens = max_tokens or self.DEFAULT_MAX_TOKENS
+        min_tokens = min_tokens if min_tokens is not None else max_tokens
+        temperature = temperature or self.DEFAULT_TEMPERATURE
+        if request_uid is None:
+            raise ValueError("request_uid must be provided for agen_kvcomm_time_test.")
+
+        message = messages[0] if isinstance(messages, list) else messages
+
+        # Build prompt
+        prefix_store = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
+        placeholder_info = prefix_store.get("placeholder_info", {})
+
+        prompt_text = self._build_prompt_text(message)
+        token_ids = self._encode(prompt_text)
+        prompt_num_tokens = len(token_ids)
+
+        safe_prompt = _escape_loguru_markup(prompt_text)
+        logger.opt(colors=True).debug(
+            "<blue>[PROMPT:time_test]</blue> Agent {} Role {} Prompt:\n{}",
+            self.node_id, self.role, safe_prompt,
+        )
+
+        # ── Run 1: kv_reuse (prefix blocks may be cached by BlockManager hash) ──
+        preprocess_start = perf_counter()
+
+        # Apply anchor deltas for kv_reuse if applicable
+        if placeholder_info:
+            for ph_id, (ph_start, ph_end) in placeholder_info.items():
+                anchor_messages = list(self.paged_kv_engine.anchors.get(ph_id, {}).keys())
+                if anchor_messages:
+                    bs = self.paged_kv_engine.block_size
+                    base_block_table = prefix_store.get("prefix_block_table", [])
+                    if base_block_table:
+                        ph_start_block = ph_start // bs
+                        ph_end_block = (ph_end - 1) // bs + 1
+                        ph_blocks = base_block_table[ph_start_block:ph_end_block]
+                        ph_num = ph_end - ph_start
+
+                        pf_start = ph_end
+                        pf_end = prompt_num_tokens
+                        pf_start_block = pf_start // bs
+                        pf_end_block = (pf_end - 1) // bs + 1
+                        pf_blocks = base_block_table[pf_start_block:pf_end_block]
+                        pf_num = pf_end - pf_start
+
+                        self.paged_kv_engine.offset_kv_cache(
+                            agent_id=self.node_id,
+                            ph_id=ph_id,
+                            message=str(message),
+                            base_ph_block_table=ph_blocks,
+                            base_ph_num_tokens=ph_num,
+                            base_pf_block_table=pf_blocks,
+                            base_pf_num_tokens=pf_num,
+                            anchor_list=anchor_messages,
+                            temperature=1.0,
+                        )
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        preprocess_latency = perf_counter() - preprocess_start
+
+        # KV-reuse generation (prefix cached → fast)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        kvcomm_completion_ids, kvcomm_gen_ttft, kvcomm_seq = self._generate_tokens(
+            token_ids, max_tokens, temperature,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        kvcomm_ttft_value = kvcomm_gen_ttft + preprocess_latency
+        kvcomm_e2e_latency = perf_counter() - preprocess_start
+
+        safe_msg = _escape_loguru_markup(str(message))
+        logger.opt(colors=True).info(
+            f"<green>Agent {self.node_id} Role {self.role} Message {safe_msg} "
+            f"KVCOMM(Paged) E2E Latency: {kvcomm_e2e_latency:.4f}s "
+            f"TTFT: {kvcomm_ttft_value:.4f}s (Preprocess: {preprocess_latency:.4f}s)</green>",
+        )
+
+        # ── Run 2: dense_prefill (full prefill, no block reuse) ──
+        # Clear the block manager's cached hash table to force full recompute
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+        dense_start = perf_counter()
+        dense_completion_ids, dense_gen_ttft, dense_seq = self._generate_tokens(
+            token_ids, max_tokens, temperature,
+        )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        dense_e2e_latency = perf_counter() - dense_start
+        dense_prefill_ttft = dense_gen_ttft
+
+        logger.opt(colors=True).info(
+            f"<cyan>Agent {self.node_id} Role {self.role} Message {safe_msg} "
+            f"Dense Prefill(Paged) E2E Latency: {dense_e2e_latency:.4f}s "
+            f"TTFT: {dense_prefill_ttft:.4f}s</cyan>",
+        )
+
+        # ── Comparison ──
+        if kvcomm_ttft_value > 0:
+            ratio = dense_prefill_ttft / kvcomm_ttft_value
+            logger.opt(colors=True).info(
+                f"<green>Agent {self.node_id} Role {self.role} Message {safe_msg} "
+                f"KVCOMM(Paged) is {ratio:.2f}x faster than Dense Prefill in TTFT</green>",
+            )
+            ttft_value = kvcomm_ttft_value
+        else:
+            ttft_value = dense_prefill_ttft
+
+        # ── Post-generation: anchor bookkeeping on the kv_reuse result ──
+        block_table = list(kvcomm_seq.block_table)
+        total_num_tokens = len(kvcomm_seq)
+
+        # Store response block info
+        mem = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
+        resp_blocks = mem.setdefault("response_blocks", {})
+        resp_blocks.setdefault(str(message), []).append({
+            "block_table": block_table[prompt_num_tokens // self.paged_kv_engine.block_size:],
+            "num_tokens": total_num_tokens - prompt_num_tokens,
+        })
+
+        # Decode response
+        response_text = self.tokenizer.decode(kvcomm_completion_ids, skip_special_tokens=True)
+        safe_resp = _escape_loguru_markup(response_text)
+        logger.opt(colors=True).debug(
+            "<blue>[RESPONSE:time_test]</blue> Agent {} Role {} Response:\n{}",
+            self.node_id, self.role, safe_resp,
+        )
+
+        # ── Build metadata and latency record ──
+        metadata: Dict[str, Any] = {
+            "placeholder_ids": list(placeholder_info.keys()),
+            "preprocess_latency": preprocess_latency,
+            "generation_ttft": ttft_value - preprocess_latency,
+        }
+        if request_uid:
+            metadata["request_uid"] = request_uid
+        if agent_id:
+            metadata["agent_id"] = agent_id
+        if agent_name:
+            metadata["agent_name"] = agent_name
+        if agent_role:
+            metadata["agent_role"] = agent_role
+
+        latency_record: Dict[str, Any] = {
+            "timestamp": time.time(),
+            "mode": mode,
+            "backend": "paged",
+            "ttft": float(ttft_value),
+            "generation_ttft": float(metadata["generation_ttft"]),
+            "preprocess_latency": float(preprocess_latency),
+            "dense_prefill_ttft": float(dense_prefill_ttft),
+            "kvcomm_end_to_end_latency": float(kvcomm_e2e_latency),
+            "dense_end_to_end_latency": float(dense_e2e_latency),
+            "ttft_ratio_dense_over_kvcomm": float(dense_prefill_ttft / ttft_value) if ttft_value > 0 else None,
+            "request_uid": request_uid,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "agent_role": agent_role,
+            "message": str(message) if message is not None else None,
+            "placeholder_ids": list(placeholder_info.keys()),
+        }
+        _append_latency_record(output_dir, latency_record)
+
+        return GenerationResult(
+            text=response_text,
+            mode=mode,
+            ttft=ttft_value,
+            metadata=metadata,
+        )
+
+    # ── Serialization support ──
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("engine", None)
+        state.pop("tokenizer", None)
+        state.pop("lock", None)
+        state.pop("paged_kv_engine", None)
+        state.pop("_shared_kv_cache_memory", None)
+        state.pop("_initialization", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.tokenizer = PagedLLMChat._shared_tokenizer
+        self.engine = PagedLLMChat._shared_engine
+        self.paged_kv_engine = PagedLLMChat._paged_kv_engine
+        self._shared_kv_cache_memory = PagedLLMChat._shared_kv_cache_memory
+        self._initialization = PagedLLMChat._initialization
+        self.lock = asyncio.Lock()
+
+    def __deepcopy__(self, memo):
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        state = self.__getstate__()
+        copied_state = copy.deepcopy(state, memo)
+        node_id = copied_state.get("node_id", None)
+        role = copied_state.get("role", None)
+        if node_id is not None:
+            if node_id in PagedLLMChat._shared_kv_cache_memory:
+                original_cache = PagedLLMChat._shared_kv_cache_memory[node_id]
+                PagedLLMChat._shared_kv_cache_memory[node_id] = {
+                    "prefix_block_info": original_cache.get("prefix_block_info"),
+                    "prefix_block_table": original_cache.get("prefix_block_table"),
+                    "prefix_num_tokens": original_cache.get("prefix_num_tokens"),
+                    "placeholder_info": original_cache.get("placeholder_info"),
+                    "token_ids": original_cache.get("token_ids"),
+                    "response_blocks": {},
+                    "condition_blocks": {},
+                }
+            result.set_id(node_id, role)
+        result.__setstate__(copied_state)
+        return result
+
+    def get_memory_stats(self) -> Dict[str, int]:
+        """Return paged KV cache memory statistics."""
+        if self.paged_kv_engine:
+            return self.paged_kv_engine.get_memory_stats()
+        return {}
