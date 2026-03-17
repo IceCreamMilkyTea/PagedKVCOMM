@@ -319,6 +319,10 @@ class PagedLLMChat(LLM):
             PagedLLMChat._shared_kv_cache_memory[self.node_id] = {}
             PagedLLMChat._initialization[self.node_id] = False
 
+    def _ensure_agent_memory(self, agent_id: str) -> Dict[str, Any]:
+        """Return the shared memory slot for a given agent id."""
+        return PagedLLMChat._shared_kv_cache_memory.setdefault(agent_id, {})
+
     def has_prefix_initialized(self, agent_id: str) -> bool:
         return PagedLLMChat._initialization.get(agent_id, False)
 
@@ -378,7 +382,7 @@ class PagedLLMChat(LLM):
 
         # Run the full prompt through the engine to populate KV blocks
         full_token_ids = self._encode(prompt_text)
-        sp = SamplingParams(temperature=0.0, max_tokens=1)
+        sp = SamplingParams(temperature=1.0, max_tokens=1)
         seq = Sequence(full_token_ids, sp)
 
         scheduler = self.engine.scheduler
@@ -721,11 +725,30 @@ class PagedLLMChat(LLM):
                     pf_blocks = block_table[pf_start_block:pf_end_block]
                     pf_num = pf_end - pf_start
 
+                    # Validate that block ranges are within the actual block table.
+                    # placeholder_info positions are from the template prompt; if the
+                    # generation prompt is shorter (e.g. just the task string), the
+                    # block indices can fall out of range.
+                    if ph_num <= 0 or not ph_blocks or ph_start_block >= len(block_table):
+                        logger.debug(
+                            "dense_prefill: skipping set_anchor for {} — placeholder blocks "
+                            "out of range (ph_start_block={}, block_table_len={})",
+                            ph_id, ph_start_block, len(block_table),
+                        )
+                        continue
+
                     # We need base blocks - stored in prefix_block_info
                     base_block_table = prefix_store.get("prefix_block_table", [])
                     if base_block_table:
                         base_ph_blocks = base_block_table[ph_start_block:ph_end_block]
                         base_pf_blocks = base_block_table[pf_start_block:pf_end_block]
+
+                        if not base_ph_blocks:
+                            logger.debug(
+                                "dense_prefill: skipping set_anchor for {} — base blocks out of range",
+                                ph_id,
+                            )
+                            continue
 
                         self.paged_kv_engine.set_anchor(
                             agent_id=self.node_id,
@@ -848,7 +871,7 @@ class PagedLLMChat(LLM):
             for i in range(10):
                 if i == 5:
                     start_time = perf_counter()
-                sp = SamplingParams(temperature=0.0, max_tokens=1)
+                sp = SamplingParams(temperature=1.0, max_tokens=1)
                 seq = Sequence(token_ids, sp)
                 scheduler = self.engine.scheduler
                 scheduler.add(seq)
@@ -864,7 +887,7 @@ class PagedLLMChat(LLM):
             )
         else:
             # Run through engine to get KV in blocks
-            sp = SamplingParams(temperature=0.0, max_tokens=1)
+            sp = SamplingParams(temperature=1.0, max_tokens=1)
             seq = Sequence(token_ids, sp)
             scheduler = self.engine.scheduler
             scheduler.add(seq)
@@ -951,7 +974,7 @@ class PagedLLMChat(LLM):
             token_ids = token_ids[:drop_num + max_length]
 
         # Run prefill through engine
-        sp = SamplingParams(temperature=0.0, max_tokens=1)
+        sp = SamplingParams(temperature=1.0, max_tokens=1)
         seq = Sequence(token_ids, sp)
         scheduler = self.engine.scheduler
         scheduler.add(seq)

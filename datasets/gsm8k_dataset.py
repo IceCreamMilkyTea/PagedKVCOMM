@@ -49,12 +49,16 @@ def _extract_boxed_content(text: str) -> str:
 
 def gsm_get_predict(pred_str):
     text = str(pred_str)
+    narrowed = False
     if "The answer is " in text:
         candidate = text.split("The answer is ", 1)[-1].strip()
+        narrowed = True
     elif "the answer is " in text:
         candidate = text.split("the answer is ", 1)[-1].strip()
+        narrowed = True
     elif "boxed" in text:
         candidate = _extract_boxed_content(text)
+        narrowed = True
     else:
         candidate = text
 
@@ -66,7 +70,12 @@ def gsm_get_predict(pred_str):
     float_pattern = r"-?\d+\.\d+|-?\d+"
     matches = re.findall(float_pattern, candidate)
 
-    return matches[0] if matches else "0"
+    if not matches:
+        return "0"
+    # When candidate was narrowed to an answer phrase, take the first number.
+    # Otherwise (full text fallback), take the last — chain-of-thought puts
+    # the final answer at the end.
+    return matches[0] if narrowed else matches[-1]
 
 
 async def get_pred_value(pred_str):
@@ -81,7 +90,8 @@ async def get_pred_value(pred_str):
     tokenizer = LLMChat._shared_tokenizer
     model = LLMChat._shared_model
     if tokenizer is None or model is None:
-        raise RuntimeError("Shared LLM resources not initialised before calling get_pred_value.")
+        # Paged backend has no HF model; fall back to regex-based extraction.
+        return gsm_get_predict(answer)
 
     messages = [
         {

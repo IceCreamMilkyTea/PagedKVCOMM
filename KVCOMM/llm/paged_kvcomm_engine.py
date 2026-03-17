@@ -284,6 +284,11 @@ class PagedKVCOMMEngine:
 
         # Compute placeholder delta: real - base
         real_ph_key, real_ph_val = self.read_kv_from_blocks(real_block_table, real_num_tokens)
+        if real_ph_key.shape[2] != real_num_tokens or real_ph_key.shape[2] == 0:
+            raise ValueError(
+                f"set_anchor: real_ph_key has {real_ph_key.shape[2]} tokens at dim 2, "
+                f"expected {real_num_tokens}. real_block_table may be empty or misaligned."
+            )
         ph_key_delta = real_ph_key - base_ph_key[..., :real_num_tokens, :]
         ph_val_delta = real_ph_val - base_ph_val[..., :real_num_tokens, :]
 

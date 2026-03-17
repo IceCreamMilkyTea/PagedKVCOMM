@@ -696,11 +696,14 @@ class KVCOMMEngine:
 
     @staticmethod
     def _stack_cache_tensors(cache: DynamicCache) -> Tuple[torch.Tensor, torch.Tensor]:
-        return torch.stack(cache.key_cache), torch.stack(cache.value_cache)
+        stacked = _stack_cache_tensors(cache)
+        if stacked is None:
+            raise RuntimeError("Cannot stack cache tensors from the current DynamicCache layout.")
+        return stacked
 
     @staticmethod
     def _placeholder_length(cache: DynamicCache) -> int:
-        return cache.key_cache[0].shape[-2]
+        return _safe_seq_len(cache)
 
     def _rotate_segment_caches(self, segment_meta: Dict[str, Any]) -> Tuple[DynamicCache, DynamicCache]:
         rotated_placeholder = self.apply_rotary_pos_emb(
@@ -876,7 +879,7 @@ class KVCOMMEngine:
         temperature: int = 1,
     ) -> Tuple[DynamicCache, DynamicCache]:
         """Blend base caches with anchor deltas weighted by similarity."""
-        placeholder_len = int(base_placeholder_cache._seen_tokens)
+        placeholder_len = _safe_seq_len(base_placeholder_cache)
         if placeholder_len <= 0:
             self._log_warning("real_placeholder_kv_cache has no tokens, skip updating.")
             return base_placeholder_cache, base_prefix_cache
@@ -958,33 +961,31 @@ class KVCOMMEngine:
             weights_value_for_placeholder * placeholder_value_delta_stack
         ).sum(0)
 
-        new_placeholder_cache = type(base_placeholder_cache)()
+        new_placeholder_cache = base_placeholder_cache.copy()
         updated_placeholder_key = (
             real_key_embedding + layer_total_delta_key_for_placeholder.to(real_key_embedding.dtype)
         )
         updated_placeholder_key[0] = real_key_embedding[0]
-        new_placeholder_cache.key_cache = list(updated_placeholder_key)
 
         updated_placeholder_value = (
             real_value_embedding + layer_total_value_delta_for_placeholder.to(real_value_embedding.dtype)
         )
         updated_placeholder_value[0] = real_value_embedding[0]
-        new_placeholder_cache.value_cache = list(updated_placeholder_value)
-        new_placeholder_cache._seen_tokens = base_placeholder_cache._seen_tokens
+        _assign_stack_to_cache(new_placeholder_cache, updated_placeholder_key, updated_placeholder_value)
+        _set_seen_tokens(new_placeholder_cache, _safe_seq_len(base_placeholder_cache))
 
         base_prefix_key, base_prefix_value = self._stack_cache_tensors(base_prefix_cache)
 
-        new_prefix_cache = type(base_prefix_cache)()
+        new_prefix_cache = base_prefix_cache.copy()
         updated_prefix_key = base_prefix_key + layer_total_delta_key_for_prefix.to(base_prefix_key.dtype)
         updated_prefix_key[0] = base_prefix_key[0]
-        new_prefix_cache.key_cache = list(updated_prefix_key)
 
         updated_prefix_value = (
             base_prefix_value + layer_total_value_delta_for_prefix.to(base_prefix_value.dtype)
         )
         updated_prefix_value[0] = base_prefix_value[0]
-        new_prefix_cache.value_cache = list(updated_prefix_value)
-        new_prefix_cache._seen_tokens = base_prefix_cache._seen_tokens
+        _assign_stack_to_cache(new_prefix_cache, updated_prefix_key, updated_prefix_value)
+        _set_seen_tokens(new_prefix_cache, _safe_seq_len(base_prefix_cache))
 
         return new_placeholder_cache, new_prefix_cache
 
@@ -1004,7 +1005,8 @@ class KVCOMMEngine:
         if test_time:
             torch.cuda.synchronize()
             start_time = perf_counter()
-        k = candidate_kv_cache.value_cache[0].shape[-2]
+        _, candidate_value_stack = self._stack_cache_tensors(candidate_kv_cache)
+        k = candidate_value_stack.shape[-2]
         anchor_available = [i for i, (j, _accum_j) in enumerate(anchor_len_list) if j >= k]
 
         if len(anchor_len_list) != len(anchor_kv_cache_list):
@@ -1015,7 +1017,7 @@ class KVCOMMEngine:
             return True, anchor_activated_list
 
         if len(anchor_available) > 1:
-            candidate_value_embedding = torch.stack(candidate_kv_cache.value_cache)[..., :k, :]
+            candidate_value_embedding = candidate_value_stack[..., :k, :]
             anchor_value_embedding = torch.stack(
                 [anchor_kv_cache_list[i]["ph_value_embedding"][..., :k, :] for i in anchor_available]
             )
@@ -1199,17 +1201,22 @@ class KVCOMMEngine:
             new_ph_cache = ph_cache.copy().slice_(start=drop_num)
         else:
             new_ph_cache = ph_cache.copy()
+        seq_len = _safe_seq_len(new_ph_cache)
+        if seq_len <= 0:
+            return new_ph_cache
         position_ids = (
-            torch.ones(new_ph_cache._seen_tokens, dtype=torch.long)
+            torch.ones(seq_len, dtype=torch.long)
             .unsqueeze(0)
             .to(self.llm.model.device)
             * offset
         )
-        cos, sin = rotate_emb(new_ph_cache.key_cache[0], position_ids)
+        key_stack, value_stack = self._stack_cache_tensors(new_ph_cache)
+        cos, sin = rotate_emb(key_stack[0], position_ids)
 
-        kv = torch.stack(new_ph_cache.key_cache, dim=0)
+        kv = key_stack
         kv_rot = self.rotate_tensor(kv, cos, sin)
-        new_ph_cache.key_cache = list(kv_rot)
+        _assign_stack_to_cache(new_ph_cache, kv_rot, value_stack)
+        _set_seen_tokens(new_ph_cache, seq_len)
         return new_ph_cache
 
     def fetch_shared_cache(

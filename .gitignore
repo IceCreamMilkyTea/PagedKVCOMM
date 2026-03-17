@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+dist/
+build/
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Logs & SLURM outputs
+logs/
+*.log
+*.err
+KVCOMM/logs/
+
+# Experiment results & run artifacts
+KVCOMM/result/
+KVCOMM/runs/
+result/
+runs/
+
+# Datasets cache
+datasets/__pycache__/
+datasets/gsm8k/
+datasets/humaneval/
+datasets/MMLU/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment / secrets
+.env
+.env.*
+*.env
+
+# Shell scripts 
+*.sh
+
+# OS
+.DS_Store
+Thumbs.db

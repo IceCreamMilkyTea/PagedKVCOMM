@@ -4,7 +4,9 @@ import sys, os
 # Enforce 512-token system prefix and 512-token outputs
 os.environ["IN_LENGTH"] = "512"
 os.environ["OUT_LENGTH"] = "512"
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 sys.stdout.reconfigure(encoding='utf-8')
 import random
 import json

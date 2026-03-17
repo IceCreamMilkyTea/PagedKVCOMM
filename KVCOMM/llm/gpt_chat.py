@@ -41,6 +41,19 @@ from KVCOMM.utils.log import logger
 MINE_API_KEYS = os.getenv('API_KEY')
 
 
+def _cache_seq_len(cache: DynamicCache) -> int:
+    """Best-effort sequence length for DynamicCache across transformers versions."""
+    getter = getattr(cache, "get_seq_length", None)
+    if callable(getter):
+        try:
+            length = getter()
+        except TypeError:
+            length = getter(0)
+        if length is not None:
+            return int(length)
+    return int(getattr(cache, "_seen_tokens", 0))
+
+
 def _escape_loguru_markup(text: Optional[str]) -> str:
     """Escape Loguru markup tokens in free-form text."""
     if text is None:
@@ -1217,7 +1230,7 @@ class LLMChat(LLM):
             zip(placeholder_entries, prefix_kv_list[1:], prefix_token_ids[1:])
         ):
             ph_cache, ph_cache_ids, drop_num = self.kv_engine.fetch_shared_cache(ph_id, message)
-            real_len = ph_cache._seen_tokens - drop_num
+            real_len = _cache_seq_len(ph_cache) - drop_num
             templ_len = end - start
             delta_len = real_len - templ_len
             meta.append(
@@ -1268,7 +1281,7 @@ class LLMChat(LLM):
             start = m["start"] + m["offset_before"]
             placeholder_indices[m["ph_id"]] = (
                 start,
-                start + m["ph_cache"]._seen_tokens - m["drop_num"],
+                start + _cache_seq_len(m["ph_cache"]) - m["drop_num"],
             )
 
         seg_cache_list = [r[1] for r in results_sorted]
@@ -1525,7 +1538,7 @@ class LLMChat(LLM):
             zip(placeholder_entries, prefix_kv_list[1:], prefix_token_ids[1:])
         ):
             ph_cache, ph_cache_ids, drop_num = self.kv_engine.fetch_shared_cache(ph_id, message)
-            real_len = ph_cache._seen_tokens - drop_num
+            real_len = _cache_seq_len(ph_cache) - drop_num
             templ_len = end - start
             delta_len = real_len - templ_len
             meta.append(
@@ -1576,7 +1589,7 @@ class LLMChat(LLM):
             start = m["start"] + m["offset_before"]
             placeholder_indices[m["ph_id"]] = (
                 start,
-                start + m["ph_cache"]._seen_tokens - m["drop_num"],
+                start + _cache_seq_len(m["ph_cache"]) - m["drop_num"],
             )
 
         seg_cache_list = [r[1] for r in results_sorted]

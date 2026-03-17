@@ -65,7 +65,7 @@ class LlamaAttention(nn.Module):
             rotary_dim=self.head_dim,
             max_position=max_position,
             base=rope_theta,
-            rope_scaling=rope_scaling,
+            rope_scaling=tuple(sorted(rope_scaling.items())) if rope_scaling else None,
         )
         self.attn = Attention(
             self.num_heads,
