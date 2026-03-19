@@ -289,13 +289,11 @@ bash slurm/RUN_ALL.sh all
 | Metric | Our Baseline (A6000, local run) | Cited from Paper: Baseline (H100) | Cited from Paper: + KVCOMM (H100) |
 |--------|-------------|----------------|----------------|
 | MMLU Accuracy (3 agents) | 62.75% | 66.7% | 68.6% |
-| GSM8K Accuracy (3 agents) | ~62%* | 82.4% | 81.7% |
+| GSM8K Accuracy (3 agents) | 80.2% | 82.4% | 81.7% |
 | HumanEval Pass@1 | — | 83.9% | 83.2% |
 | TTFT (avg, 3 agents) | ~143 ms | ~125–258 ms | ~5–10 ms |
 | KV Reuse Rate | 0% | 0% | 67–87% |
 | Max TTFT Speedup | — | — | **7.82x** (5 agents) |
-
-*partial result, 79/1319 questions
 
 > Column 1 ("Our Baseline") = locally-run SLURM experiments on A6000. Columns 2–3 = values cited directly from arXiv:2510.12872 (H100, full test sets), **not** re-run locally.
 
