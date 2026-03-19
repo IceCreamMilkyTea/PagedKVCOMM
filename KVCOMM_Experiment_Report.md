@@ -11,11 +11,11 @@
 
 ## 1. Executive Summary
 
-This report documents our Checkpoint 1 reproduction and verification of the KVCOMM system (arXiv:2510.12872). We successfully set up the full experiment pipeline on Duke's SLURM cluster, ran baseline experiments on MMLU and GSM8K benchmarks, and compared results against the original paper. Key findings:
+This report documents our Checkpoint 1 reproduction and verification of the KVCOMM system (arXiv:2510.12872). We successfully set up the full experiment pipeline on Duke's SLURM cluster, ran baseline experiments on MMLU and GSM8K benchmarks, and compared our locally-obtained results against values reported in the original paper. Key findings:
 
-- **MMLU Baseline (Dense Prefill, 3 agents):** 62.75% accuracy — **within 4% of the paper's 3-agent result (66.7%)**
-- **GSM8K Baseline (Dense Prefill, 3 agents):** ~62% accuracy (partial, 79/1319 batches) — **lower than paper's 82.4%**, likely due to hardware and generation configuration differences
-- **Average TTFT (MMLU):** ~143 ms on A6000 vs. ~125–430 ms range on H100 in the original paper
+- **MMLU Baseline (Dense Prefill, 3 agents):** 62.75% accuracy (local run) — **within 4% of the paper's reported 3-agent result (66.7%, cited from paper)**
+- **GSM8K Baseline (Dense Prefill, 3 agents):** ~62% accuracy (local run, partial, 79/1319 batches) — **lower than the paper's reported 82.4% (cited from paper)**, likely due to hardware and generation configuration differences
+- **Average TTFT (MMLU):** ~143 ms on A6000 (local run) vs. ~125–430 ms range on H100 (cited from paper)
 - **KV Reuse Rate (Baseline):** 0% as expected (no reuse in dense prefill mode)
 
 ---
@@ -54,12 +54,14 @@ This report documents our Checkpoint 1 reproduction and verification of the KVCO
 
 ## 3. Results
 
+> **Data-source convention:** In the tables below, **"Our Result"** refers to values obtained from our local SLURM runs on an A6000 GPU. Columns marked **"Cited from Paper"** contain values taken directly from Tables 1–3 of arXiv:2510.12872 (H100 GPU, full test sets); these were **not** re-run locally.
+
 ### 3.1 MMLU Baseline — Dense Prefill (Completed)
 
-| Metric | Our Result | Paper (3 agents) | Paper (5 agents) |
+| Metric | Our Result (A6000, local run) | Cited from Paper (3 agents, H100) | Cited from Paper (5 agents, H100) |
 |--------|-----------|-------------------|-------------------|
 | **Accuracy** | **62.75% (96/153)** | 66.7% | 69.9% |
-| **Avg TTFT** | **142.7 ms** | N/A (reported per-agent) | ~125–430 ms (H100) |
+| **Avg TTFT** | **142.7 ms** | N/A (reported per-agent) | ~125–430 ms |
 | **KV Reuse Rate** | 0.0% | 0.0% (baseline) | 0.0% (baseline) |
 | **Total Agent Calls** | 612 | — | — |
 | **Runtime** | 54 min 3 sec | — | — |
@@ -77,7 +79,7 @@ This report documents our Checkpoint 1 reproduction and verification of the KVCO
 
 ### 3.2 GSM8K Baseline — Dense Prefill (In Progress)
 
-| Metric | Our Result (partial) | Paper (3 agents) |
+| Metric | Our Result (A6000, local run, partial) | Cited from Paper (3 agents, H100) |
 |--------|---------------------|-------------------|
 | **Accuracy** | **~62% (79 batches)** | 82.4% |
 | **Avg TTFT** | **~121 ms** | N/A |
@@ -98,9 +100,11 @@ The HumanEval benchmark requires Qwen2.5-Coder-7B-Instruct, which has not been d
 
 ## 4. Comparison with Original Paper Results
 
+> **Note:** All values in this section labeled "Cited from Paper" are taken **directly** from the published tables in arXiv:2510.12872 (run on H100 GPUs with full test sets). They were **not** re-run locally. "Our Result" values come from our SLURM runs on the A6000 described in Section 2.
+
 ### 4.1 Accuracy Comparison (Baseline, Dense Prefill)
 
-| Benchmark | Our Result | Paper (3 agents) | Paper (5 agents) | Difference (3-agent) |
+| Benchmark | Our Result (A6000, local run) | Cited from Paper (3 agents, H100) | Cited from Paper (5 agents, H100) | Difference (3-agent) |
 |-----------|-----------|-------------------|-------------------|--------------------|
 | MMLU | 62.75% | 66.7% | 69.9% | -3.95% |
 | GSM8K | ~62.0%* | 82.4% | 81.7% | -20.4%* |
@@ -108,9 +112,9 @@ The HumanEval benchmark requires Qwen2.5-Coder-7B-Instruct, which has not been d
 
 *GSM8K result is partial (79/1319 questions)
 
-### 4.2 Original Paper: KVCOMM vs. Baseline
+### 4.2 Cited from Paper: KVCOMM vs. Baseline (H100, full test sets)
 
-The paper demonstrates that KVCOMM maintains accuracy comparable to dense prefill while achieving significant TTFT speedup:
+The paper demonstrates that KVCOMM maintains accuracy comparable to dense prefill while achieving significant TTFT speedup. **All values below are cited directly from arXiv:2510.12872, not re-run locally:**
 
 | Benchmark | Baseline (3 agents) | KVCOMM (3 agents) | Accuracy Change | Reuse Rate |
 |-----------|---------------------|-------------------|----------------|------------|
@@ -118,7 +122,9 @@ The paper demonstrates that KVCOMM maintains accuracy comparable to dense prefil
 | GSM8K | 82.4% | 81.7% | -0.7% | ~75% |
 | HumanEval | 83.9% | 83.2% | -0.7% | ~83% |
 
-### 4.3 Original Paper: TTFT Speedup (5 agents, H100)
+### 4.3 Cited from Paper: TTFT Speedup (5 agents, H100)
+
+**All values below are cited directly from arXiv:2510.12872, not re-run locally:**
 
 | Agent | Original TTFT | KVCOMM TTFT | Speedup |
 |-------|---------------|-------------|---------|
@@ -128,7 +134,9 @@ The paper demonstrates that KVCOMM maintains accuracy comparable to dense prefil
 | 4 | 330.9 ms | 13.5 ms | 6.85x |
 | 5 | 428.6 ms | 17.5 ms | **7.82x** |
 
-### 4.4 Original Paper: Ablation Studies
+### 4.4 Cited from Paper: Ablation Studies (H100, full test sets)
+
+**All values below are cited directly from arXiv:2510.12872, not re-run locally.**
 
 **Entropy Threshold (γ) on GSM8K, 4 agents:**
 
@@ -278,16 +286,18 @@ bash slurm/RUN_ALL.sh all
 
 ## 9. Summary of Key Metrics
 
-| Metric | Our Baseline | Paper Baseline | Paper + KVCOMM |
+| Metric | Our Baseline (A6000, local run) | Cited from Paper: Baseline (H100) | Cited from Paper: + KVCOMM (H100) |
 |--------|-------------|----------------|----------------|
 | MMLU Accuracy (3 agents) | 62.75% | 66.7% | 68.6% |
 | GSM8K Accuracy (3 agents) | ~62%* | 82.4% | 81.7% |
 | HumanEval Pass@1 | — | 83.9% | 83.2% |
-| TTFT (avg, 3 agents) | ~143 ms (A6000) | ~125–258 ms (H100) | ~5–10 ms (H100) |
+| TTFT (avg, 3 agents) | ~143 ms | ~125–258 ms | ~5–10 ms |
 | KV Reuse Rate | 0% | 0% | 67–87% |
 | Max TTFT Speedup | — | — | **7.82x** (5 agents) |
 
 *partial result, 79/1319 questions
+
+> Column 1 ("Our Baseline") = locally-run SLURM experiments on A6000. Columns 2–3 = values cited directly from arXiv:2510.12872 (H100, full test sets), **not** re-run locally.
 
 ---
 
