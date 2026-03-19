@@ -14,7 +14,7 @@
 This report documents our Checkpoint 1 reproduction and verification of the KVCOMM system (arXiv:2510.12872). We successfully set up the full experiment pipeline on Duke's SLURM cluster, ran baseline experiments on MMLU and GSM8K benchmarks, and compared our locally-obtained results against values reported in the original paper. Key findings:
 
 - **MMLU Baseline (Dense Prefill, 3 agents):** 62.75% accuracy (local run) — **within 4% of the paper's reported 3-agent result (66.7%, cited from paper)**
-- **GSM8K Baseline (Dense Prefill, 3 agents):** ~62% accuracy (local run, partial, 79/1319 batches) — **lower than the paper's reported 82.4% (cited from paper)**, likely due to hardware and generation configuration differences
+- **GSM8K Baseline (Dense Prefill, 3 agents):** 80.2% accuracy (local run, partial, 79/1319 batches) — **lower than the paper's reported 82.4% (cited from paper)**, likely due to hardware and generation configuration differences
 - **Average TTFT (MMLU):** ~143 ms on A6000 (local run) vs. ~125–430 ms range on H100 (cited from paper)
 - **KV Reuse Rate (Baseline):** 0% as expected (no reuse in dense prefill mode)
 
