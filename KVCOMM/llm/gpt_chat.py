@@ -61,6 +61,16 @@ def _escape_loguru_markup(text: Optional[str]) -> str:
     return text.replace("<", "\\<")
 
 
+def _preview_message(text: Optional[str], max_len: int = 140) -> str:
+    """Create a one-line preview for verbose debug logs."""
+    if text is None:
+        return ""
+    compact = text.replace("\n", "\\n")
+    if len(compact) <= max_len:
+        return compact
+    return compact[:max_len] + "..."
+
+
 _LATENCY_IO_LOCK = threading.Lock()
 
 
@@ -571,10 +581,19 @@ class LLMChat(LLM):
         """Determine whether an anchor should trigger dense prefill."""
         state = self.get_request_state(request_uid)
         ph_ids = LLMChat._shared_kv_cache_memory.get(self.node_id, {}).get('placeholder_info', {}).keys()
+        print(f"[ANCHOR_CHECK] node={self.node_id}, ph_ids={list(ph_ids)}", flush=True)
+
         for ph_id in ph_ids:
             bucket = state.anchor_dict.setdefault(ph_id, {})
-            if bucket.get(message) is True and f'{self.node_id}_ph_key_delta' not in state.anchors.get(ph_id, {}).get(message, {}):
+            has_flag = bucket.get(message)
+            has_delta = f'{self.node_id}_ph_key_delta' in state.anchors.get(ph_id, {}).get(message, {})
+            
+            print(f"[ANCHOR_CHECK] ph_id={ph_id}, has_flag={has_flag}, has_delta={has_delta}", flush=True)
+            
+            if has_flag is True and not has_delta:
+                print(f"[ANCHOR_FOUND] ph_id={ph_id} triggered dense_prefill!", flush=True)
                 return True
+        print(f"[ANCHOR_CHECK] No active anchor found, return False", flush=True)
         return False
 
     def update_condition_anchor(
@@ -785,9 +804,12 @@ class LLMChat(LLM):
         input_cache = output.past_key_values
 
         global_buckets = self._ensure_global_input_buckets()
-        global_buckets["input"].setdefault(message, []).append(
-            input_cache.copy().slice_(start=0, end=token_ids["input_ids"].shape[-1])
-        )
+        input_cache_with_drop = input_cache.copy().slice_(start=0, end=token_ids["input_ids"].shape[-1])
+        input_cache_len = input_cache_with_drop.get_seq_length()
+        input_ids_len = token_ids["input_ids"].shape[-1]
+        print(f"[ANCHOR_SAVE] anchor_namespace={anchor_namespace}, message_hash={hash(message)}, input_cache_seq_len={input_cache_len}, input_ids_len={input_ids_len}, drop_num={drop_num}", flush=True)
+        
+        global_buckets["input"].setdefault(message, []).append(input_cache_with_drop)
         global_buckets["input_ids"].setdefault(message, []).append(token_ids)
         global_buckets["input_drop_num"].setdefault(message, []).append(drop_num)
 
@@ -849,13 +871,15 @@ class LLMChat(LLM):
     ) -> GenerationResult:
         """Generate a response using the requested strategy with sensible fallbacks."""
         latency_target = output_dir or kwargs.get("output_dir")
+        print(f"[DBG][node={self.node_id}][role={self.role}] Generating for node_id={self.node_id}, preferred_mode={preferred_mode}, message={message}", flush=True)
         if preferred_mode == "dense_prefill":
             mode = "dense_prefill"
         elif self.has_active_anchor(request_uid, message):
             mode = "dense_prefill"
         else:
             mode = "kv_reuse"
-
+            
+        print(f"[DBG][node={self.node_id}][role={self.role}] After has_active_anchor, Generating for node_id={self.node_id}, mode={mode}, message={message}", flush=True)
         if mode == "dense_prefill":
             return await self.generate_with_dense_prefill(
                 message,
@@ -906,6 +930,7 @@ class LLMChat(LLM):
             self._initialization[self.node_id] = LLMChat._initialization[self.node_id] = False
 
     async def prepare_prefix_kv_segments(self, node_id: str, prefix: str, user_prompt: str):
+        # Compute the base KV-caches for the placeholder samples absent in the shared memory and store them in the shared memory
         """Materialize and store prefix KV segments and placeholder indices.
 
         The rendered prompt is tokenized and executed once to obtain the KV
@@ -1192,6 +1217,11 @@ class LLMChat(LLM):
         - dense_prefill: compute fresh prefix KV and optionally set anchors
         - kv_reuse: reuse existing prefix KV and inject as past_key_values
         """
+        debug = os.getenv("KVCOMM_DEBUG", "0") == "1"
+        def dprint(*args):
+            if debug:
+                print(f"[KVDEBUG][node={self.node_id}][role={self.role}]", *args, flush=True)
+
         if max_tokens is None:
             max_tokens = self.DEFAULT_MAX_TOKENS
         if temperature is None:
@@ -1210,6 +1240,13 @@ class LLMChat(LLM):
         prefix_kv_list: List[DynamicCache] = prefix_store.get("prefix", [])
         prefix_token_ids: List[Dict[str, torch.Tensor]] = prefix_store.get("token_ids", [])
         placeholder_info_map = prefix_store.get("placeholder_info")
+        
+        dprint("PREFIX_STORE",
+            "prefix_store=", prefix_store,
+            "prefix_kv_list=", len(prefix_kv_list),
+            "prefix_token_ids=", len(prefix_token_ids),
+            "placeholders=", list(placeholder_info_map.keys()) if placeholder_info_map else None)
+                    
         if not prefix_kv_list:
             raise RuntimeError(
                 "No prefix KV found in shared memory. Make sure you've called prepare_prefix_kv_segments or init_shared_placeholder_prefix_kv."
@@ -1233,6 +1270,14 @@ class LLMChat(LLM):
             real_len = _cache_seq_len(ph_cache) - drop_num
             templ_len = end - start
             delta_len = real_len - templ_len
+            
+            ph_cache_seq_len = _cache_seq_len(ph_cache)
+            ph_ids_len = ph_cache_ids["input_ids"].shape[-1] if ph_cache_ids else 0
+            print(
+                f"[CACHE_FETCH] mode={mode}, ph_id={ph_id}, message_hash={hash(message)}, message_preview={_preview_message(message)}, ph_cache_seq_len={ph_cache_seq_len}, ph_ids_len={ph_ids_len}, drop_num={drop_num}, real_len={real_len}",
+                flush=True,
+            )
+            
             meta.append(
                 {
                     "idx": idx,
