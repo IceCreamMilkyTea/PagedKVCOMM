@@ -54,13 +54,26 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+        prefilled = len(seq.block_table)
+        needed = max(0, seq.num_blocks - prefilled)
+        return len(self.free_block_ids) >= needed
 
     def allocate(self, seq: Sequence):
-        assert not seq.block_table
+        prefilled = len(seq.block_table)
+        if prefilled > seq.num_blocks:
+            raise ValueError(
+                f"prefilled blocks exceed sequence blocks: {prefilled}>{seq.num_blocks}"
+            )
+
+        # If caller pre-injected prefix blocks, continue allocation from tail.
         h = -1
-        cache_miss = False
-        for i in range(seq.num_blocks):
+        if prefilled > 0:
+            for i in range(prefilled):
+                token_ids = seq.block(i)
+                h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+
+        cache_miss = prefilled > 0
+        for i in range(prefilled, seq.num_blocks):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
             block_id = self.hash_to_block_id.get(h, -1)
@@ -97,7 +110,7 @@ class BlockManager:
         block_table = seq.block_table
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
-            assert last_block.hash != -1
+            # Pre-injected custom prefix blocks may not be registered in hash map.
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)

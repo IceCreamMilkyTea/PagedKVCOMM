@@ -1007,7 +1007,7 @@ class KVCOMMEngine:
             start_time = perf_counter()
         _, candidate_value_stack = self._stack_cache_tensors(candidate_kv_cache)
         k = candidate_value_stack.shape[-2]
-        anchor_available = [i for i, (j, _accum_j) in enumerate(anchor_len_list) if j >= k]
+        anchor_available = [i for i, (j, _accum_j) in enumerate(anchor_len_list) if j >= k] # Eq5 condition(1): length
 
         if len(anchor_len_list) != len(anchor_kv_cache_list):
             self._log_warning(
@@ -1025,7 +1025,7 @@ class KVCOMMEngine:
             sim = torch.softmax(-diff.float(), dim=0)
             threshold = self.llm.config.threshold
             entropy = -(sim * (sim + entropy_eps).log2()).sum()
-            if entropy > threshold * torch.log2(torch.tensor(sim.shape[0])):
+            if entropy > threshold * torch.log2(torch.tensor(sim.shape[0])): # Eq5 condition(2): entropy
                 logger.opt(colors=True).debug(
                     f"<yellow>Entropy {entropy:.4f} exceeds threshold {threshold * torch.log2(torch.tensor(sim.shape[0])):.4f}, "
                     "skip activating anchors.</yellow>"
@@ -1050,7 +1050,7 @@ class KVCOMMEngine:
                         f"{len(anchor_activated_list)}"
                     )
                     continue
-                anchor_activated_list[anchor_available[i]] += 1
+                anchor_activated_list[anchor_available[i]] += 1 # Count the number of times each anchor is activated for potential future eviction
             if test_time:
                 torch.cuda.synchronize()
                 end_time = perf_counter()

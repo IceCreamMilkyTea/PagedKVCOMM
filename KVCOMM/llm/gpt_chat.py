@@ -61,14 +61,37 @@ def _escape_loguru_markup(text: Optional[str]) -> str:
     return text.replace("<", "\\<")
 
 
-def _preview_message(text: Optional[str], max_len: int = 140) -> str:
+def _preview_message(text: Optional[str]) -> str:
     """Create a one-line preview for verbose debug logs."""
     if text is None:
         return ""
-    compact = text.replace("\n", "\\n")
-    if len(compact) <= max_len:
-        return compact
-    return compact[:max_len] + "..."
+    return text.replace("\n", "\\n")
+
+
+def _preview_token_ids(
+    tokenizer: Any,
+    token_ids: Optional[Dict[str, torch.Tensor]],
+    *,
+    drop_num: int = 0,
+) -> str:
+    """Decode token ids into one-line text for cache-content debugging."""
+    if not token_ids or "input_ids" not in token_ids:
+        return ""
+    input_ids = token_ids.get("input_ids")
+    if input_ids is None:
+        return ""
+
+    ids = input_ids
+    if hasattr(ids, "ndim") and ids.ndim > 1:
+        ids = ids[0]
+    if drop_num > 0:
+        ids = ids[drop_num:]
+
+    try:
+        decoded = tokenizer.decode(ids.tolist(), skip_special_tokens=True)
+    except Exception:
+        return ""
+    return _preview_message(decoded)
 
 
 _LATENCY_IO_LOCK = threading.Lock()
@@ -591,6 +614,7 @@ class LLMChat(LLM):
             print(f"[ANCHOR_CHECK] ph_id={ph_id}, has_flag={has_flag}, has_delta={has_delta}", flush=True)
             
             if has_flag is True and not has_delta:
+                # New anchor and agent hasn't dense prefill and store the context delta, so trigger dense prefill for the first time.
                 print(f"[ANCHOR_FOUND] ph_id={ph_id} triggered dense_prefill!", flush=True)
                 return True
         print(f"[ANCHOR_CHECK] No active anchor found, return False", flush=True)
@@ -1270,11 +1294,16 @@ class LLMChat(LLM):
             real_len = _cache_seq_len(ph_cache) - drop_num
             templ_len = end - start
             delta_len = real_len - templ_len
+            ph_content_preview = _preview_token_ids(
+                self.tokenizer,
+                ph_cache_ids,
+                drop_num=drop_num,
+            )
             
             ph_cache_seq_len = _cache_seq_len(ph_cache)
             ph_ids_len = ph_cache_ids["input_ids"].shape[-1] if ph_cache_ids else 0
             print(
-                f"[CACHE_FETCH] mode={mode}, ph_id={ph_id}, message_hash={hash(message)}, message_preview={_preview_message(message)}, ph_cache_seq_len={ph_cache_seq_len}, ph_ids_len={ph_ids_len}, drop_num={drop_num}, real_len={real_len}",
+                f"[CACHE_READ] mode={mode}, ph_id={ph_id}, message_hash={hash(message)}, message_preview={_preview_message(message)}, ph_content_preview={ph_content_preview}, ph_cache_seq_len={ph_cache_seq_len}, ph_ids_len={ph_ids_len}, drop_num={drop_num}, real_len={real_len}",
                 flush=True,
             )
             
@@ -1320,6 +1349,21 @@ class LLMChat(LLM):
             raise ValueError(f"Unsupported mode '{mode}' for agen_kvcomm.")
 
         results_sorted = sorted(results, key=lambda x: x[0])
+        if mode == "kv_reuse":
+            idx_to_meta = {m["idx"]: m for m in meta}
+            for idx, seg_cache, seg_ids in results_sorted:
+                ph_id = idx_to_meta.get(idx, {}).get("ph_id", "unknown")
+                seg_len = _cache_seq_len(seg_cache)
+                seg_ids_len = (
+                    seg_ids["input_ids"].shape[-1]
+                    if isinstance(seg_ids, dict) and "input_ids" in seg_ids
+                    else 0
+                )
+                seg_content_preview = _preview_token_ids(self.tokenizer, seg_ids)
+                print(
+                    f"[CACHE_REUSE_APPLY] ph_id={ph_id}, message_hash={hash(message)}, message_preview={_preview_message(message)}, seg_content_preview={seg_content_preview}, seg_cache_seq_len={seg_len}, seg_ids_len={seg_ids_len}",
+                    flush=True,
+                )
 
         placeholder_indices: Dict[str, Tuple[int, int]] = {}
         for m in meta:
@@ -1367,6 +1411,7 @@ class LLMChat(LLM):
         preprocess_latency = 0.0
         if preprocess_start is not None:
             preprocess_latency = max(0.0, perf_counter() - preprocess_start)
+        # Generate response
         outputs = self.model.generate(**merged_prefix_token_ids, **generation_kwargs)
         if ttft_tracer.ttft is None:
             if torch.cuda.is_available():
@@ -1401,7 +1446,12 @@ class LLMChat(LLM):
                 window_length=window_length,
             )
 
+        # Slice out the response tokens' KV-cache from the full sequence KV-cache.
+        # At this point, response token keys are RoPE-encoded at absolute positions
+        # [prefix_token_length, prefix_token_length + 1, ...] within this agent's context.
         response_kv_cache = full_kv_cache.slice_(start=prefix_token_length)
+        # De-rotate the response key cache by -prefix_token_length to remove this agent's positional context
+        # Get a base kv cache for this placeholder response segment
         response_kv_cache = self.kv_engine.apply_rotary_pos_emb(
             response_kv_cache,
             offset=-prefix_token_length,
@@ -1448,12 +1498,12 @@ class LLMChat(LLM):
             anchor_kv_cache_list=response_anchor_list,
             anchor_len_list=anchor_len_list,
             anchor_activated_list=anchor_active_list,
-        )
+        ) # prob = True/False
         safe_message = _escape_loguru_markup(message)
         logger.opt(colors=True).debug(
             f"<magenta>Agent {self.node_id} Role {self.role} Message {safe_message} Response Anchor Prediction: {prob}</magenta>",
         )
-        state.anchor_dict.setdefault(current_key, {})[message] = prob
+        state.anchor_dict.setdefault(current_key, {})[message] = prob # Store the anchor prediction result for set_anchor 
 
         if not prob:
             global_bucket = state.global_anchor_info.setdefault(current_key, {})
@@ -1755,7 +1805,7 @@ class LLMChat(LLM):
             anchor_len_list=anchor_len_list,
             anchor_activated_list=anchor_active_list,
             test_time=True,
-        )
+        ) # anchor_active_list is the count list of how many times each anchor has been activated, which will be used for eviction in set_anchor
         safe_message = _escape_loguru_markup(message)
         logger.opt(colors=True).debug(
             f"<magenta>Agent {self.node_id} Role {self.role} Message {safe_message} Response Anchor Prediction: {prob}</magenta>",
@@ -1766,7 +1816,7 @@ class LLMChat(LLM):
             global_bucket = state.global_anchor_info.setdefault(current_key, {})
             info_items = list(anchor_info_bucket.items())
             for idx, (msg_key, _) in enumerate(info_items):
-                anchor_info_bucket[msg_key] = anchor_active_list[idx]
+                anchor_info_bucket[msg_key] = anchor_active_list[idx] # Update the active count in anchor_info_bucket with the new count from prediction
                 bucket_entry = global_bucket.setdefault(msg_key, [0, 0])
                 bucket_entry[0] = anchor_active_list[idx]
 

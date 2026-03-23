@@ -310,6 +310,24 @@ class PagedLLMChat(LLM):
         """Encode text to token IDs."""
         return self.tokenizer.encode(text, add_special_tokens=False)
 
+    @staticmethod
+    def _message_cache_key(message: Any) -> str:
+        """Build a stable cache key for anchor/reuse dictionaries."""
+        if isinstance(message, str):
+            return message
+        if isinstance(message, dict) or isinstance(message, list):
+            try:
+                return json.dumps(message, ensure_ascii=False, sort_keys=True)
+            except TypeError:
+                return str(message)
+        if isinstance(message, Message):
+            return json.dumps(
+                {"role": message.role, "content": message.content},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        return str(message)
+
     # ── Agent identity ──
 
     def set_id(self, node_id: str, role: str):
@@ -333,6 +351,8 @@ class PagedLLMChat(LLM):
         token_ids: List[int],
         max_tokens: int = 512,
         temperature: float = 0.0,
+        cached_prefix_block_table: Optional[List[int]] = None,
+        cached_prefix_num_tokens: int = 0,
     ) -> Tuple[List[int], float, Sequence]:
         """Run prefill + decode through nano-vllm's LLMEngine.
 
@@ -343,7 +363,12 @@ class PagedLLMChat(LLM):
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        seq = Sequence(token_ids, sp)
+        seq = Sequence(
+            token_ids,
+            sp,
+            prefilled_block_table=cached_prefix_block_table,
+            num_cached_tokens=cached_prefix_num_tokens,
+        )
 
         # Add to scheduler
         scheduler = self.engine.scheduler
@@ -366,6 +391,113 @@ class PagedLLMChat(LLM):
             ttft = 0.0
 
         return seq.completion_token_ids, ttft, seq
+
+    def _prepare_kv_reuse_prefix_blocks(
+        self,
+        *,
+        prefix_store: Dict[str, Any],
+        placeholder_info: Dict[str, List[int]],
+        prompt_num_tokens: int,
+        message_key: str,
+    ) -> Tuple[Optional[List[int]], int, Dict[str, Any]]:
+        """Build pre-injected cached prefix blocks for kv_reuse mode.
+
+        Returns (block_table, cached_tokens, stats).
+        """
+        stats: Dict[str, Any] = {
+            "anchor_candidates": 0,
+            "offset_calls": 0,
+            "offset_effective": 0,
+            "offset_applied": False,
+            "fallback_reason": None,
+        }
+
+        base_block_table = list(prefix_store.get("prefix_block_table", []) or [])
+        if not base_block_table:
+            stats["fallback_reason"] = "no_prefix_block_table"
+            return None, 0, stats
+        if not placeholder_info:
+            stats["fallback_reason"] = "no_placeholder_info"
+            return None, 0, stats
+
+        # Current implementation supports one placeholder for stable block stitching.
+        ph_items = sorted(placeholder_info.items(), key=lambda x: x[1][0])
+        if len(ph_items) != 1:
+            stats["fallback_reason"] = "multi_placeholder_not_supported"
+            return None, 0, stats
+
+        ph_id, (ph_start, ph_end) = ph_items[0]
+        anchor_messages = list(self.paged_kv_engine.anchors.get(ph_id, {}).keys())
+        stats["anchor_candidates"] = len(anchor_messages)
+        if not anchor_messages:
+            stats["fallback_reason"] = "no_anchor_messages"
+            return None, 0, stats
+
+        bs = self.paged_kv_engine.block_size
+        ph_start_block = ph_start // bs
+        ph_end_block = (ph_end - 1) // bs + 1
+        pf_start = ph_end
+        pf_end = prompt_num_tokens
+        pf_start_block = pf_start // bs
+        pf_end_block = (pf_end - 1) // bs + 1 if pf_end > 0 else 0
+
+        if ph_start_block >= len(base_block_table):
+            stats["fallback_reason"] = "placeholder_out_of_base_range"
+            return None, 0, stats
+
+        base_ph_blocks = base_block_table[ph_start_block:ph_end_block]
+        base_pf_blocks = base_block_table[pf_start_block:pf_end_block]
+        ph_num = ph_end - ph_start
+        pf_num = max(0, pf_end - pf_start)
+
+        if ph_num <= 0 or not base_ph_blocks:
+            stats["fallback_reason"] = "invalid_placeholder_block_span"
+            return None, 0, stats
+
+        stats["offset_calls"] += 1
+        new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache(
+            agent_id=self.node_id,
+            ph_id=ph_id,
+            message=message_key,
+            base_ph_block_table=base_ph_blocks,
+            base_ph_num_tokens=ph_num,
+            base_pf_block_table=base_pf_blocks,
+            base_pf_num_tokens=pf_num,
+            anchor_list=anchor_messages,
+            temperature=1.0,
+        )
+
+        if new_ph_blocks != base_ph_blocks or new_pf_blocks != base_pf_blocks:
+            stats["offset_effective"] += 1
+
+        # Stitch full prompt prefix blocks: [before placeholder] + [offset placeholder] + [offset tail].
+        pre_blocks = base_block_table[:ph_start_block]
+        if pre_blocks:
+            self.paged_kv_engine.increment_ref(pre_blocks)
+
+        combined_blocks = pre_blocks + list(new_ph_blocks) + list(new_pf_blocks)
+        expected_blocks = (prompt_num_tokens + bs - 1) // bs
+        if len(combined_blocks) != expected_blocks:
+            if pre_blocks:
+                self.paged_kv_engine.free_blocks(pre_blocks)
+
+            # If offset returned base blocks (no-op), free only our temporary refs.
+            if new_ph_blocks == base_ph_blocks:
+                self.paged_kv_engine.free_blocks(new_ph_blocks)
+            else:
+                self.paged_kv_engine.free_blocks(new_ph_blocks)
+            if new_pf_blocks == base_pf_blocks:
+                self.paged_kv_engine.free_blocks(new_pf_blocks)
+            else:
+                self.paged_kv_engine.free_blocks(new_pf_blocks)
+
+            stats["fallback_reason"] = (
+                f"combined_blocks_mismatch:{len(combined_blocks)}!={expected_blocks}"
+            )
+            return None, 0, stats
+
+        stats["offset_applied"] = True
+        return combined_blocks, prompt_num_tokens, stats
 
     # ── Prefix preparation (paged version) ──
 
@@ -677,6 +809,16 @@ class PagedLLMChat(LLM):
             preprocess_start = perf_counter()
 
             message = messages[0] if isinstance(messages, list) else messages
+            message_key = self._message_cache_key(message)
+            reuse_stats: Dict[str, Any] = {
+                "mode": mode,
+                "placeholder_count": 0,
+                "anchor_candidates": 0,
+                "offset_calls": 0,
+                "offset_effective": 0,
+                "num_cached_tokens": 0,
+                "num_blocks": 0,
+            }
 
             # Build prompt
             prefix_store = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
@@ -691,10 +833,36 @@ class PagedLLMChat(LLM):
                 mode, self.node_id, self.role, safe_prompt,
             )
 
+            cached_prefix_block_table = None
+            cached_prefix_num_tokens = 0
+            if mode == "kv_reuse":
+                (
+                    cached_prefix_block_table,
+                    cached_prefix_num_tokens,
+                    offset_stats,
+                ) = self._prepare_kv_reuse_prefix_blocks(
+                    prefix_store=prefix_store,
+                    placeholder_info=placeholder_info,
+                    prompt_num_tokens=len(token_ids),
+                    message_key=message_key,
+                )
+                reuse_stats["anchor_candidates"] = offset_stats["anchor_candidates"]
+                reuse_stats["offset_calls"] = offset_stats["offset_calls"]
+                reuse_stats["offset_effective"] = offset_stats["offset_effective"]
+                if not offset_stats["offset_applied"]:
+                    logger.debug(
+                        "kv_reuse fallback to dense behavior for this request: {}",
+                        offset_stats["fallback_reason"],
+                    )
+
             # Generate through nano-vllm engine
             preprocess_latency = perf_counter() - preprocess_start
             completion_ids, ttft, seq = self._generate_tokens(
-                token_ids, max_tokens, temperature,
+                token_ids,
+                max_tokens,
+                temperature,
+                cached_prefix_block_table=cached_prefix_block_table,
+                cached_prefix_num_tokens=cached_prefix_num_tokens,
             )
 
             total_ttft = ttft + preprocess_latency
@@ -703,12 +871,16 @@ class PagedLLMChat(LLM):
             block_table = list(seq.block_table)
             prompt_num_tokens = len(token_ids)
             total_num_tokens = len(seq)
+            reuse_stats["num_cached_tokens"] = int(getattr(seq, "num_cached_tokens", 0))
+            reuse_stats["num_blocks"] = len(block_table)
+            reuse_stats["placeholder_count"] = len(placeholder_info)
 
             # ── Anchor operations ──
             if mode == "dense_prefill" and placeholder_info:
                 # After full prefill, store anchor deltas
                 for ph_id, (ph_start, ph_end) in placeholder_info.items():
                     anchor_messages = list(self.paged_kv_engine.anchors.get(ph_id, {}).keys())
+                    reuse_stats["anchor_candidates"] += len(anchor_messages)
 
                     # Block range for placeholder portion
                     bs = self.paged_kv_engine.block_size
@@ -753,7 +925,7 @@ class PagedLLMChat(LLM):
                         self.paged_kv_engine.set_anchor(
                             agent_id=self.node_id,
                             ph_id=ph_id,
-                            message=str(message),
+                            message=message_key,
                             real_block_table=ph_blocks,
                             real_num_tokens=ph_num,
                             base_block_table=base_ph_blocks,
@@ -764,42 +936,17 @@ class PagedLLMChat(LLM):
                             base_prefix_num_tokens=pf_num,
                         )
 
-            elif mode == "kv_reuse" and placeholder_info:
-                # Apply anchor deltas to modify KV in place
-                for ph_id, (ph_start, ph_end) in placeholder_info.items():
-                    anchor_messages = list(self.paged_kv_engine.anchors.get(ph_id, {}).keys())
-
-                    if anchor_messages:
-                        bs = self.paged_kv_engine.block_size
-                        ph_start_block = ph_start // bs
-                        ph_end_block = (ph_end - 1) // bs + 1
-                        ph_blocks = block_table[ph_start_block:ph_end_block]
-                        ph_num = ph_end - ph_start
-
-                        pf_start = ph_end
-                        pf_end = prompt_num_tokens
-                        pf_start_block = pf_start // bs
-                        pf_end_block = (pf_end - 1) // bs + 1
-                        pf_blocks = block_table[pf_start_block:pf_end_block]
-                        pf_num = pf_end - pf_start
-
-                        # Offset modifies KV in-place via write_kv_to_blocks
-                        new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache(
-                            agent_id=self.node_id,
-                            ph_id=ph_id,
-                            message=str(message),
-                            base_ph_block_table=ph_blocks,
-                            base_ph_num_tokens=ph_num,
-                            base_pf_block_table=pf_blocks,
-                            base_pf_num_tokens=pf_num,
-                            anchor_list=anchor_messages,
-                            temperature=1.0,
-                        )
+            elif mode == "kv_reuse" and cached_prefix_block_table:
+                logger.debug(
+                    "kv_reuse pre-injected cached prefix blocks: cached_tokens={}, blocks={}",
+                    cached_prefix_num_tokens,
+                    len(cached_prefix_block_table),
+                )
 
             # Store response block info for future reuse
             mem = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
             resp_blocks = mem.setdefault("response_blocks", {})
-            resp_blocks.setdefault(str(message), []).append({
+            resp_blocks.setdefault(message_key, []).append({
                 "block_table": block_table[prompt_num_tokens // self.paged_kv_engine.block_size:],
                 "num_tokens": total_num_tokens - prompt_num_tokens,
             })
@@ -814,6 +961,7 @@ class PagedLLMChat(LLM):
 
             metadata: Dict[str, Any] = {
                 "placeholder_ids": list(placeholder_info.keys()),
+                "reuse_stats": reuse_stats,
             }
             if request_uid:
                 metadata["request_uid"] = request_uid
@@ -830,7 +978,12 @@ class PagedLLMChat(LLM):
                 "ttft": float(total_ttft),
                 "request_uid": request_uid,
                 "agent_id": agent_id,
-                "message": str(message) if message else None,
+                "message": message_key if message else None,
+                "num_cached_tokens": reuse_stats["num_cached_tokens"],
+                "num_blocks": reuse_stats["num_blocks"],
+                "anchor_candidates": reuse_stats["anchor_candidates"],
+                "offset_calls": reuse_stats["offset_calls"],
+                "offset_effective": reuse_stats["offset_effective"],
             })
 
             return GenerationResult(
@@ -1083,6 +1236,7 @@ class PagedLLMChat(LLM):
             raise ValueError("request_uid must be provided for agen_kvcomm_time_test.")
 
         message = messages[0] if isinstance(messages, list) else messages
+        message_key = self._message_cache_key(message)
 
         # Build prompt
         prefix_store = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
@@ -1124,7 +1278,7 @@ class PagedLLMChat(LLM):
                         self.paged_kv_engine.offset_kv_cache(
                             agent_id=self.node_id,
                             ph_id=ph_id,
-                            message=str(message),
+                            message=message_key,
                             base_ph_block_table=ph_blocks,
                             base_ph_num_tokens=ph_num,
                             base_pf_block_table=pf_blocks,
@@ -1193,7 +1347,7 @@ class PagedLLMChat(LLM):
         # Store response block info
         mem = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
         resp_blocks = mem.setdefault("response_blocks", {})
-        resp_blocks.setdefault(str(message), []).append({
+        resp_blocks.setdefault(message_key, []).append({
             "block_table": block_table[prompt_num_tokens // self.paged_kv_engine.block_size:],
             "num_tokens": total_num_tokens - prompt_num_tokens,
         })
