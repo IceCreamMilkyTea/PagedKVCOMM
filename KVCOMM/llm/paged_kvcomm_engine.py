@@ -82,8 +82,9 @@ class PagedAnchorEntry:
     ):
         self.block_table = block_table
         self.num_tokens = num_tokens
-        self.ph_key_embedding = ph_key_embedding
-        self.ph_value_embedding = ph_value_embedding
+        # Keep similarity embeddings on CPU to avoid long-run GPU memory growth.
+        self.ph_key_embedding = ph_key_embedding.detach().cpu()
+        self.ph_value_embedding = ph_value_embedding.detach().cpu()
         # agent_id → {"ph_delta_blocks": [...], "pf_delta_blocks": [...], ...}
         self.agent_deltas: Dict[str, Dict[str, Any]] = {}
 
@@ -422,11 +423,15 @@ class PagedKVCOMMEngine:
         base_ph_key, base_ph_val = self.read_kv_from_blocks(base_ph_block_table, base_ph_num_tokens)
         base_pf_key, base_pf_val = self.read_kv_from_blocks(base_pf_block_table, base_pf_num_tokens)
 
-        # Compute similarity weights (same logic as KVCOMMEngine)
-        anchor_ph_keys = torch.stack([
-            e.ph_key_embedding[..., -base_ph_num_tokens:, :] for _, e in valid_anchors
-        ])
-        sims = (base_ph_key.unsqueeze(0) - anchor_ph_keys).norm(2, dim=-2)
+        # Compute similarity weights (same logic as KVCOMMEngine) without stacking
+        # all anchors into one large tensor (reduces peak VRAM).
+        sims_list = []
+        for _, entry in valid_anchors:
+            anchor_key = entry.ph_key_embedding[..., -base_ph_num_tokens:, :]
+            if anchor_key.device != base_ph_key.device:
+                anchor_key = anchor_key.to(base_ph_key.device, non_blocking=True)
+            sims_list.append((base_ph_key - anchor_key).norm(2, dim=-2))
+        sims = torch.stack(sims_list, dim=0)
         weights = torch.softmax(-sims.float() / temperature, dim=0).unsqueeze(-2)
 
         # Weighted sum of deltas (placeholder)
@@ -481,6 +486,7 @@ class PagedKVCOMMEngine:
         anchor_messages: List[str],
         top_p: float = 0.9,
         entropy_threshold: float = 0.5,
+        max_compare_anchors: int = 64,
     ) -> Tuple[bool, List[int]]:
         """Decide whether to activate anchors based on KV similarity.
 
@@ -503,6 +509,11 @@ class PagedKVCOMMEngine:
             if entry is not None and entry.num_tokens >= candidate_num_tokens:
                 available_indices.append(i)
                 available_entries.append(entry)
+
+        # Compare only a bounded recent subset to keep predict path memory stable.
+        if max_compare_anchors > 0 and len(available_entries) > max_compare_anchors:
+            available_indices = available_indices[-max_compare_anchors:]
+            available_entries = available_entries[-max_compare_anchors:]
 
         if len(anchor_messages) == 0:
             reason = "no_anchor_history"
@@ -528,12 +539,14 @@ class PagedKVCOMMEngine:
         # Read candidate KV
         _, cand_val = self.read_kv_from_blocks(candidate_block_table, candidate_num_tokens)
 
-        # Read anchor embeddings
-        anchor_vals = torch.stack([
-            e.ph_value_embedding[..., :candidate_num_tokens, :] for e in available_entries
-        ])
-
-        diff = (cand_val.unsqueeze(0) - anchor_vals).norm(2, dim=(1, 2, 3, 4))
+        # Stream anchor distance computation to avoid large temporary tensors.
+        diff_list = []
+        for entry in available_entries:
+            anchor_val = entry.ph_value_embedding[..., :candidate_num_tokens, :]
+            if anchor_val.device != cand_val.device:
+                anchor_val = anchor_val.to(cand_val.device, non_blocking=True)
+            diff_list.append((cand_val - anchor_val).norm(2, dim=(0, 1, 2, 3)))
+        diff = torch.stack(diff_list, dim=0)
         sim = torch.softmax(-diff.float(), dim=0)
 
         # Entropy check

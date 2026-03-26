@@ -1267,6 +1267,7 @@ class PagedLLMChat(LLM):
             anchor_messages=anchor_messages,
             top_p=0.9,
             entropy_threshold=self.config.threshold,
+            max_compare_anchors=self.config.max_anchor_num,
         )
 
         uq_info_bucket = PagedLLMChat._anchor_info_dict.setdefault(anchor_namespace, {})
@@ -1407,6 +1408,7 @@ class PagedLLMChat(LLM):
             anchor_messages=anchor_messages,
             top_p=0.9,
             entropy_threshold=self.config.threshold,
+            max_compare_anchors=self.config.max_anchor_num,
         )
 
         cond_info_bucket = PagedLLMChat._anchor_info_dict.setdefault(anchor_key, {})
