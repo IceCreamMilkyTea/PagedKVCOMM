@@ -48,9 +48,7 @@ class MathSolver(Node):
                 for agent_id, info in spatial_info.items():
                     if info["role"] != "Programming Expert":
                         continue
-                    answer = execute_code_get_return(
-                        info["output"].lstrip("```python\n").rstrip("\n```")
-                    )
+                    answer = execute_code_get_return(info["output"])
                     self.llm.update_condition_anchor(
                         request_uid=request_uid,
                         owner_agent_id=agent_id,
@@ -163,7 +161,7 @@ class MathSolver(Node):
                 agent_role=self.role,
             )
             if self.role == "Programming Expert":
-                answer = execute_code_get_return(result.text.lstrip("```python\n").rstrip("\n```"))
+                answer = execute_code_get_return(result.text)
                 result.text += f"\nthe answer is {answer}"
             return result
 
@@ -192,6 +190,6 @@ class MathSolver(Node):
         )
 
         if self.role == "Programming Expert":
-            answer = execute_code_get_return(result.text.split("```python\n")[-1].split("\n```")[0])
+            answer = execute_code_get_return(result.text)
             result.text += f"\nthe answer is {answer}"
         return input['task'], result

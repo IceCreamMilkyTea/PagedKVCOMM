@@ -999,7 +999,15 @@ class KVCOMMEngine:
         entropy_eps: float = 1e-40,
         test_time: bool = False,
     ) -> Tuple[bool, List[int]]:
-        if len(anchor_kv_cache_list) in [0, 1]:
+        if len(anchor_kv_cache_list) == 0:
+            logger.info(
+                "[ANCHOR_PREDICT:hf] anchors=0 decision=dense_prefill reason=no_anchor_history"
+            )
+            return True, anchor_activated_list
+        if len(anchor_kv_cache_list) == 1:
+            logger.info(
+                "[ANCHOR_PREDICT:hf] anchors=1 decision=dense_prefill reason=single_anchor"
+            )
             return True, anchor_activated_list
 
         if test_time:
@@ -1007,7 +1015,7 @@ class KVCOMMEngine:
             start_time = perf_counter()
         _, candidate_value_stack = self._stack_cache_tensors(candidate_kv_cache)
         k = candidate_value_stack.shape[-2]
-        anchor_available = [i for i, (j, _accum_j) in enumerate(anchor_len_list) if j >= k]
+        anchor_available = [i for i, (j, _accum_j) in enumerate(anchor_len_list) if j >= k] # Eq5 condition(1): length
 
         if len(anchor_len_list) != len(anchor_kv_cache_list):
             self._log_warning(
@@ -1025,7 +1033,7 @@ class KVCOMMEngine:
             sim = torch.softmax(-diff.float(), dim=0)
             threshold = self.llm.config.threshold
             entropy = -(sim * (sim + entropy_eps).log2()).sum()
-            if entropy > threshold * torch.log2(torch.tensor(sim.shape[0])):
+            if entropy > threshold * torch.log2(torch.tensor(sim.shape[0])): # Eq5 condition(2): entropy
                 logger.opt(colors=True).debug(
                     f"<yellow>Entropy {entropy:.4f} exceeds threshold {threshold * torch.log2(torch.tensor(sim.shape[0])):.4f}, "
                     "skip activating anchors.</yellow>"
@@ -1050,7 +1058,7 @@ class KVCOMMEngine:
                         f"{len(anchor_activated_list)}"
                     )
                     continue
-                anchor_activated_list[anchor_available[i]] += 1
+                anchor_activated_list[anchor_available[i]] += 1 # Count the number of times each anchor is activated for potential future eviction
             if test_time:
                 torch.cuda.synchronize()
                 end_time = perf_counter()
@@ -1058,6 +1066,18 @@ class KVCOMMEngine:
                     f"<cyan>Latency for Anchor prediction: {end_time - start_time} s</cyan>"
                 )
             return False, anchor_activated_list
+        if len(anchor_available) == 0:
+            logger.info(
+                "[ANCHOR_PREDICT:hf] anchors={} length_eligible=0 candidate_tokens={} decision=dense_prefill reason=no_length_eligible_anchor",
+                len(anchor_kv_cache_list),
+                k,
+            )
+        else:
+            logger.info(
+                "[ANCHOR_PREDICT:hf] anchors={} length_eligible=1 candidate_tokens={} decision=dense_prefill reason=single_length_eligible_anchor",
+                len(anchor_kv_cache_list),
+                k,
+            )
         logger.opt(colors=True).debug("<yellow>No available anchors to activate.</yellow>")
         return True, anchor_activated_list
 

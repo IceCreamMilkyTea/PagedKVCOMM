@@ -128,7 +128,7 @@ class CodeWriting(Node):
                     "In the last round of dialogue, the outputs and feedbacks of some agents were: \n\n"
                     f"{temporal_str}"
                 )
-            await self.llm.prepare_prefix_kv_segments(self.id, system_prompt, user_prompt)
+            await self.llm.prepare_prefix_kv_segments(self.id, system_prompt, user_prompt) # Compute the base KV-caches for the placeholder samples absent in the shared memory and store them in the shared memory
             return {"preferred_mode": preferred_mode, "early_response": None}
 
         system_prompt = self.constraint

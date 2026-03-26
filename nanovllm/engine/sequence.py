@@ -15,15 +15,27 @@ class Sequence:
     block_size = 256
     counter = count()
 
-    def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
+    def __init__(
+        self,
+        token_ids: list[int],
+        sampling_params=SamplingParams(),
+        prefilled_block_table: list[int] | None = None,
+        num_cached_tokens: int = 0,
+    ):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
-        self.num_cached_tokens = 0
-        self.block_table = []
+        self.num_cached_tokens = max(0, min(num_cached_tokens, self.num_prompt_tokens))
+        # Optional pre-injected prefix blocks for prompt reuse.
+        self.block_table = list(prefilled_block_table) if prefilled_block_table else []
+        if self.block_table and self.num_cached_tokens == 0:
+            self.num_cached_tokens = min(
+                len(self.block_table) * self.block_size,
+                self.num_prompt_tokens,
+            )
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos

@@ -30,13 +30,17 @@ class Scheduler:
             seq = self.waiting[0]
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
-            num_seqs += 1
             self.block_manager.allocate(seq)
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
+            uncached_tokens = len(seq) - seq.num_cached_tokens
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             self.running.append(seq)
-            scheduled_seqs.append(seq)
+            # Fully-cached prompts do not need a prefill forward. They should
+            # go directly through decode to avoid zero-query varlen kernels.
+            if uncached_tokens > 0:
+                num_seqs += 1
+                num_batched_tokens += uncached_tokens
+                scheduled_seqs.append(seq)
         if scheduled_seqs:
             return scheduled_seqs, True
 

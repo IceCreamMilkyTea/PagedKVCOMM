@@ -63,6 +63,8 @@ def gsm_get_predict(pred_str):
         candidate = text
 
     candidate = _strip_string(candidate).rstrip("./").strip()
+    # Normalize thousands separators so values like "70,000" are parsed as 70000.
+    candidate = candidate.replace(",", "")
     if "boxed" in candidate:
         candidate = _extract_boxed_content(candidate)
         candidate = _strip_string(candidate).strip()
