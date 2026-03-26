@@ -394,15 +394,23 @@ class PagedKVCOMMEngine:
             self.increment_ref(base_pf_block_table)
             return base_ph_block_table, base_ph_num_tokens, base_pf_block_table, base_pf_num_tokens
 
-        # Collect valid anchors
+        # Collect valid anchors with per-agent deltas that fully cover current spans.
         valid_anchors = []
         for msg in anchor_list:
             entry = ph_store.get(msg)
             if entry is None:
                 continue
-            if agent_id not in entry.agent_deltas:
+            delta_info = entry.agent_deltas.get(agent_id)
+            if delta_info is None:
                 continue
             if entry.num_tokens >= base_ph_num_tokens:
+                ph_delta_tokens = int(delta_info.get("ph_delta_num_tokens", 0) or 0)
+                if ph_delta_tokens < base_ph_num_tokens:
+                    continue
+                if base_pf_num_tokens > 0:
+                    pf_delta_tokens = int(delta_info.get("pf_delta_num_tokens", 0) or 0)
+                    if pf_delta_tokens < base_pf_num_tokens:
+                        continue
                 valid_anchors.append((msg, entry))
 
         if not valid_anchors:
@@ -428,7 +436,7 @@ class PagedKVCOMMEngine:
             delta_info = entry.agent_deltas[agent_id]
             dk, dv = self.read_kv_from_blocks(
                 delta_info["ph_delta_blocks"],
-                min(delta_info["ph_delta_num_tokens"], base_ph_num_tokens),
+                base_ph_num_tokens,
             )
             w = weights[i]
             ph_delta_sum_k += w * dk[..., :base_ph_num_tokens, :]
@@ -439,10 +447,9 @@ class PagedKVCOMMEngine:
         pf_delta_sum_v = torch.zeros_like(base_pf_val)
         for i, (msg, entry) in enumerate(valid_anchors):
             delta_info = entry.agent_deltas[agent_id]
-            dk, dv = self.read_kv_from_blocks(
-                delta_info["pf_delta_blocks"],
-                delta_info["pf_delta_num_tokens"],
-            )
+            if base_pf_num_tokens <= 0:
+                continue
+            dk, dv = self.read_kv_from_blocks(delta_info["pf_delta_blocks"], base_pf_num_tokens)
             w = weights[i]
             pf_delta_sum_k += w * dk
             pf_delta_sum_v += w * dv

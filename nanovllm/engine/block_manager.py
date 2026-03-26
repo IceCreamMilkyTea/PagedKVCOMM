@@ -32,6 +32,32 @@ class BlockManager:
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
 
+    def _sanitize_free_list(self):
+        """Remove stale/duplicate entries from free list and repair used set."""
+        cleaned: deque[int] = deque()
+        seen: set[int] = set()
+        for block_id in self.free_block_ids:
+            if block_id in seen:
+                continue
+            seen.add(block_id)
+            block = self.blocks[block_id]
+            if block.ref_count == 0:
+                cleaned.append(block_id)
+            else:
+                self.used_block_ids.add(block_id)
+        self.free_block_ids = cleaned
+        self.used_block_ids = {
+            block_id
+            for block_id in self.used_block_ids
+            if self.blocks[block_id].ref_count > 0
+        }
+
+    def _pop_free_block_id(self) -> int:
+        self._sanitize_free_list()
+        if not self.free_block_ids:
+            raise RuntimeError("No free KV-cache blocks available after sanitization")
+        return self.free_block_ids.popleft()
+
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         h = xxhash.xxh64()
@@ -42,18 +68,24 @@ class BlockManager:
 
     def _allocate_block(self, block_id: int) -> Block:
         block = self.blocks[block_id]
-        assert block.ref_count == 0
+        if block.ref_count != 0:
+            raise RuntimeError(
+                f"Attempted to allocate non-free block {block_id} with ref_count={block.ref_count}"
+            )
         block.reset()
-        self.free_block_ids.remove(block_id)
+        if block_id in self.free_block_ids:
+            self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
         return self.blocks[block_id]
 
     def _deallocate_block(self, block_id: int) -> Block:
         assert self.blocks[block_id].ref_count == 0
-        self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
+        self.used_block_ids.discard(block_id)
+        if block_id not in self.free_block_ids:
+            self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> bool:
+        self._sanitize_free_list()
         prefilled = len(seq.block_table)
         needed = max(0, seq.num_blocks - prefilled)
         return len(self.free_block_ids) >= needed
@@ -80,7 +112,7 @@ class BlockManager:
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
             if cache_miss:
-                block_id = self.free_block_ids[0]
+                block_id = self._pop_free_block_id()
                 block = self._allocate_block(block_id)
             else:
                 seq.num_cached_tokens += self.block_size
@@ -104,6 +136,7 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
+        self._sanitize_free_list()
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
@@ -111,7 +144,7 @@ class BlockManager:
         last_block = self.blocks[block_table[-1]]
         if len(seq) % self.block_size == 1:
             # Pre-injected custom prefix blocks may not be registered in hash map.
-            block_id = self.free_block_ids[0]
+            block_id = self._pop_free_block_id()
             self._allocate_block(block_id)
             block_table.append(block_id)
         elif len(seq) % self.block_size == 0:
