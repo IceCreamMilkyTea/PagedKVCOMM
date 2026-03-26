@@ -46,6 +46,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from loguru import logger
 
 # nano-vllm imports
 from nanovllm.engine.block_manager import BlockManager, Block
@@ -185,6 +186,16 @@ class PagedKVCOMMEngine:
         key = key.transpose(1, 2).contiguous()
         value = value.transpose(1, 2).contiguous()
 
+        if num_tokens <= 0:
+            return
+        if not block_table:
+            raise ValueError("write_kv_to_blocks: empty block_table for positive num_tokens")
+        if key.shape[1] != num_tokens or value.shape[1] != num_tokens:
+            raise ValueError(
+                "write_kv_to_blocks token mismatch: "
+                f"num_tokens={num_tokens}, key_tokens={key.shape[1]}, value_tokens={value.shape[1]}"
+            )
+
         block_ids = torch.tensor(block_table, dtype=torch.long, device=self.kv_cache.device)
 
         for layer_idx in range(self.num_layers):
@@ -237,6 +248,40 @@ class PagedKVCOMMEngine:
             self.block_manager.blocks[bid].ref_count += 1
 
     # ─────────────────────── Anchor Operations ───────────────────────
+
+    def register_base_anchor(
+        self,
+        ph_id: str,
+        message: str,
+        block_table: List[int],
+        num_tokens: int,
+    ) -> bool:
+        """Register a base anchor entry directly from existing blocks.
+
+        This is used to bootstrap anchor history before dense set_anchor paths
+        become available for a placeholder.
+
+        Returns:
+            True if a new anchor entry was created, False otherwise.
+        """
+        if num_tokens <= 0 or not block_table:
+            return False
+
+        ph_key, ph_val = self.read_kv_from_blocks(block_table, num_tokens)
+
+        with self._lock:
+            ph_store = self.anchors.setdefault(ph_id, {})
+            if message in ph_store:
+                return False
+
+            self.increment_ref(block_table)
+            ph_store[message] = PagedAnchorEntry(
+                block_table=list(block_table),
+                num_tokens=num_tokens,
+                ph_key_embedding=ph_key,
+                ph_value_embedding=ph_val,
+            )
+            return True
 
     def set_anchor(
         self,
@@ -297,17 +342,22 @@ class PagedKVCOMMEngine:
         self.write_kv_to_blocks(ph_delta_blocks, ph_key_delta, ph_val_delta, real_num_tokens)
 
         # Compute prefix delta: real - base
+        if real_prefix_num_tokens <= 0 or base_prefix_num_tokens <= 0:
+            return
         real_pf_key, real_pf_val = self.read_kv_from_blocks(
             real_prefix_block_table, real_prefix_num_tokens
         )
         base_pf_key, base_pf_val = self.read_kv_from_blocks(
             base_prefix_block_table, base_prefix_num_tokens
         )
-        pf_key_delta = real_pf_key - base_pf_key
-        pf_val_delta = real_pf_val - base_pf_val
+        pf_tokens = min(real_pf_key.shape[2], base_pf_key.shape[2], real_prefix_num_tokens, base_prefix_num_tokens)
+        if pf_tokens <= 0:
+            return
+        pf_key_delta = real_pf_key[..., :pf_tokens, :] - base_pf_key[..., :pf_tokens, :]
+        pf_val_delta = real_pf_val[..., :pf_tokens, :] - base_pf_val[..., :pf_tokens, :]
 
-        pf_delta_blocks = self.allocate_blocks_for_tokens(real_prefix_num_tokens)
-        self.write_kv_to_blocks(pf_delta_blocks, pf_key_delta, pf_val_delta, real_prefix_num_tokens)
+        pf_delta_blocks = self.allocate_blocks_for_tokens(pf_tokens)
+        self.write_kv_to_blocks(pf_delta_blocks, pf_key_delta, pf_val_delta, pf_tokens)
 
         # Store delta block references for this agent
         with self._lock:
@@ -315,7 +365,7 @@ class PagedKVCOMMEngine:
                 "ph_delta_blocks": ph_delta_blocks,
                 "ph_delta_num_tokens": real_num_tokens,
                 "pf_delta_blocks": pf_delta_blocks,
-                "pf_delta_num_tokens": real_prefix_num_tokens,
+                "pf_delta_num_tokens": pf_tokens,
             }
 
     def offset_kv_cache(
@@ -430,7 +480,11 @@ class PagedKVCOMMEngine:
         Same logic as KVCOMMEngine.predict_as_anchor() but reads from blocks.
 
         Returns:
-            (should_skip, activated_counts)
+            (prob, activated_counts)
+
+        Notes:
+            - prob == True  => treat as new anchor (dense_prefill path)
+            - prob == False => reuse existing anchors (kv_reuse path)
         """
         ph_store = self.anchors.get(ph_id, {})
         activated = [0] * len(anchor_messages)
@@ -443,7 +497,25 @@ class PagedKVCOMMEngine:
                 available_indices.append(i)
                 available_entries.append(entry)
 
+        if len(anchor_messages) == 0:
+            reason = "no_anchor_history"
+        elif len(available_entries) == 0:
+            reason = "no_length_eligible_anchor"
+        elif len(available_entries) == 1:
+            reason = "single_length_eligible_anchor"
+        else:
+            reason = "insufficient_anchors"
+
         if len(available_entries) <= 1:
+            logger.info(
+                "[ANCHOR_PREDICT:paged] ph_id={} anchor_messages={} available_entries={} "
+                "candidate_num_tokens={} decision=dense_prefill reason={}",
+                ph_id,
+                len(anchor_messages),
+                len(available_entries),
+                candidate_num_tokens,
+                reason,
+            )
             return True, activated
 
         # Read candidate KV
@@ -461,6 +533,16 @@ class PagedKVCOMMEngine:
         entropy = -(sim * (sim + 1e-40).log2()).sum()
         threshold = entropy_threshold * torch.log2(torch.tensor(float(sim.shape[0])))
         if entropy > threshold:
+            logger.info(
+                "[ANCHOR_PREDICT:paged] ph_id={} anchor_messages={} available_entries={} "
+                "candidate_num_tokens={} entropy={} threshold={} decision=dense_prefill reason=high_entropy",
+                ph_id,
+                len(anchor_messages),
+                len(available_entries),
+                candidate_num_tokens,
+                float(entropy.item()),
+                float(threshold.item()),
+            )
             return True, activated
 
         # Top-p selection
@@ -475,6 +557,15 @@ class PagedKVCOMMEngine:
             if idx < len(activated):
                 activated[idx] += 1
 
+        logger.info(
+            "[ANCHOR_PREDICT:paged] ph_id={} anchor_messages={} available_entries={} "
+            "candidate_num_tokens={} selected={} decision=kv_reuse",
+            ph_id,
+            len(anchor_messages),
+            len(available_entries),
+            candidate_num_tokens,
+            int(len(selected)),
+        )
         return False, activated
 
     def get_seq_block_table(self, seq: Sequence) -> List[int]:

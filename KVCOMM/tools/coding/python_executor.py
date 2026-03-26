@@ -1,5 +1,6 @@
 import ast
 import astunparse
+import re
 from typing import List
 
 from KVCOMM.tools.coding.executor_utils import function_with_timeout
@@ -8,6 +9,40 @@ import multiprocessing as mp
 import textwrap
 import traceback
 import queue
+import io
+from contextlib import redirect_stdout
+
+
+def _extract_python_candidate(text: str) -> str | None:
+    """Return executable python snippet or None if input is not code."""
+    if text is None:
+        return None
+
+    raw = str(text).strip()
+    if not raw:
+        return None
+
+    # Prefer explicit fenced python blocks.
+    py_blocks = re.findall(r"```python\s*(.*?)\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
+    if py_blocks:
+        candidate = py_blocks[-1].strip()
+        return candidate or None
+
+    # Generic fenced block fallback.
+    fenced_blocks = re.findall(r"```\s*(.*?)\s*```", raw, flags=re.DOTALL)
+    if fenced_blocks:
+        candidate = fenced_blocks[-1].strip()
+        if candidate.lower().startswith("python\n"):
+            candidate = candidate.split("\n", 1)[1].strip()
+        return candidate or None
+
+    # No fenced block: only execute if the whole text is valid Python.
+    try:
+        ast.parse(raw)
+    except SyntaxError:
+        return None
+    return raw
+
 
 def get_call_str(assert_statement: str) -> str:
     ast_parsed = ast.parse(assert_statement)
@@ -42,20 +77,32 @@ def get_output(func: str, assert_statement: str, timeout: int = 5) -> str:
 
 def execute_code_get_return(code: str, timeout: int = 5):
     """在子进程执行 code，超过 timeout 秒直接终止，并返回 answer 变量（或错误信息）。"""
-    def _runner(q):
-        local_vars = {}
-        try:
+    code_to_run = _extract_python_candidate(code)
+    if code_to_run is None:
+        return "Skipped: non-python content"
 
-            exec(textwrap.dedent(code), {}, local_vars)
-            res = local_vars.get("answer")
+    def _runner(q):
+        namespace = {}
+        buf = io.StringIO()
+        try:
+            with redirect_stdout(buf):
+                exec(textwrap.dedent(code_to_run), namespace, namespace)
+            res = namespace.get("answer")
 
             if callable(res):
                 res = res()
 
+            if res is None:
+                printed = buf.getvalue().strip()
+                if printed:
+                    lines = [line for line in printed.splitlines() if line.strip()]
+                    res = lines[-1] if lines else printed
+                else:
+                    res = "Executed: no answer variable"
+
             q.put(res)
         except Exception:
-
-            q.put(f"Error occurred:\n{traceback.format_exc()}")
+            q.put(f"Error: {traceback.format_exc().splitlines()[-1]}")
 
     q = mp.Queue()
     p = mp.Process(target=_runner, args=(q,))

@@ -604,20 +604,37 @@ class LLMChat(LLM):
         """Determine whether an anchor should trigger dense prefill."""
         state = self.get_request_state(request_uid)
         ph_ids = LLMChat._shared_kv_cache_memory.get(self.node_id, {}).get('placeholder_info', {}).keys()
-        print(f"[ANCHOR_CHECK] node={self.node_id}, ph_ids={list(ph_ids)}", flush=True)
+        logger.info(
+            "[ANCHOR_CHECK:hf] node={} role={} request_uid={} ph_ids={} message_key_present_check_start",
+            getattr(self, "node_id", "?"),
+            getattr(self, "role", "?"),
+            request_uid,
+            list(ph_ids),
+        )
 
         for ph_id in ph_ids:
             bucket = state.anchor_dict.setdefault(ph_id, {})
             has_flag = bucket.get(message)
             has_delta = f'{self.node_id}_ph_key_delta' in state.anchors.get(ph_id, {}).get(message, {})
-            
-            print(f"[ANCHOR_CHECK] ph_id={ph_id}, has_flag={has_flag}, has_delta={has_delta}", flush=True)
-            
+
+            force_dense = bool(has_flag is True and not has_delta)
+            logger.info(
+                "[ANCHOR_CHECK:hf] node={} ph_id={} has_message={} has_agent_delta={} -> force_dense={}",
+                getattr(self, "node_id", "?"),
+                ph_id,
+                bool(has_flag),
+                has_delta,
+                force_dense,
+            )
+
             if has_flag is True and not has_delta:
                 # New anchor and agent hasn't dense prefill and store the context delta, so trigger dense prefill for the first time.
-                print(f"[ANCHOR_FOUND] ph_id={ph_id} triggered dense_prefill!", flush=True)
                 return True
-        print(f"[ANCHOR_CHECK] No active anchor found, return False", flush=True)
+        logger.info(
+            "[ANCHOR_CHECK:hf] node={} request_uid={} force_dense=False (no active anchor)",
+            getattr(self, "node_id", "?"),
+            request_uid,
+        )
         return False
 
     def update_condition_anchor(
@@ -831,7 +848,7 @@ class LLMChat(LLM):
         input_cache_with_drop = input_cache.copy().slice_(start=0, end=token_ids["input_ids"].shape[-1])
         input_cache_len = input_cache_with_drop.get_seq_length()
         input_ids_len = token_ids["input_ids"].shape[-1]
-        print(f"[ANCHOR_SAVE] anchor_namespace={anchor_namespace}, message_hash={hash(message)}, input_cache_seq_len={input_cache_len}, input_ids_len={input_ids_len}, drop_num={drop_num}", flush=True)
+        # print(f"[ANCHOR_SAVE] anchor_namespace={anchor_namespace}, message_hash={hash(message)}, input_cache_seq_len={input_cache_len}, input_ids_len={input_ids_len}, drop_num={drop_num}", flush=True)
         
         global_buckets["input"].setdefault(message, []).append(input_cache_with_drop)
         global_buckets["input_ids"].setdefault(message, []).append(token_ids)
@@ -851,12 +868,43 @@ class LLMChat(LLM):
         for bucket in state.anchor_len_dict.values():
             accumulate_len += bucket.get(message, [0, 0])[0]
 
+        candidate_cache = input_cache.copy().slice_(start=drop_num)
+        candidate_num_tokens = candidate_cache.get_seq_length()
+        length_eligible = [
+            idx for idx, (plen, _accum) in enumerate(anchor_len_list)
+            if plen >= candidate_num_tokens
+        ]
+
         prob, anchor_activated_list = self.kv_engine.predict_as_anchor(
-            input_cache.copy().slice_(start=drop_num),
+            candidate_cache,
             anchor_kv_cache_list=input_anchor_list,
             anchor_len_list=anchor_len_list,
             anchor_activated_list=anchor_activated_list,
             test_time=test_time,
+        )
+        if len(input_anchor_list) == 0:
+            decision_reason = "no_anchor_history"
+        elif len(length_eligible) == 0:
+            decision_reason = "no_length_eligible_anchor"
+        elif len(length_eligible) == 1:
+            decision_reason = "single_length_eligible_anchor"
+        elif prob:
+            decision_reason = "high_entropy_or_similarity_uncertain"
+        else:
+            decision_reason = "kv_reuse"
+        logger.info(
+            "[INPUT_ANCHOR_DECISION:hf] node={} role={} request_uid={} ph_id={} message={} "
+            "candidate_num_tokens={} anchor_messages={} length_eligible={} prob={} reason={}",
+            getattr(self, "node_id", "?"),
+            getattr(self, "role", "?"),
+            request_uid,
+            anchor_namespace,
+            safe_message,
+            candidate_num_tokens,
+            len(input_anchor_list),
+            len(length_eligible),
+            prob,
+            decision_reason,
         )
         logger.opt(colors=True).debug(
             f"<magenta>Anchor prediction for input '{safe_message}'</magenta>: {prob}"
@@ -895,15 +943,25 @@ class LLMChat(LLM):
     ) -> GenerationResult:
         """Generate a response using the requested strategy with sensible fallbacks."""
         latency_target = output_dir or kwargs.get("output_dir")
-        print(f"[DBG][node={self.node_id}][role={self.role}] Generating for node_id={self.node_id}, preferred_mode={preferred_mode}, message={message}", flush=True)
+        anchor_forces_dense = self.has_active_anchor(request_uid, message)
+        mode = "dense_prefill" if (preferred_mode == "dense_prefill" or anchor_forces_dense) else "kv_reuse"
         if preferred_mode == "dense_prefill":
-            mode = "dense_prefill"
-        elif self.has_active_anchor(request_uid, message):
-            mode = "dense_prefill"
+            mode_reason = "preferred_dense_prefill"
+        elif anchor_forces_dense:
+            mode_reason = "active_anchor_requires_dense"
         else:
-            mode = "kv_reuse"
-            
-        print(f"[DBG][node={self.node_id}][role={self.role}] After has_active_anchor, Generating for node_id={self.node_id}, mode={mode}, message={message}", flush=True)
+            mode_reason = "preferred_kv_reuse"
+        logger.info(
+            "[MODE_DECISION:hf] node={} role={} request_uid={} preferred_mode={} "
+            "anchor_forces_dense={} selected_mode={} reason={}",
+            getattr(self, "node_id", "?"),
+            getattr(self, "role", "?"),
+            request_uid,
+            preferred_mode,
+            anchor_forces_dense,
+            mode,
+            mode_reason,
+        )
         if mode == "dense_prefill":
             return await self.generate_with_dense_prefill(
                 message,
@@ -1252,6 +1310,15 @@ class LLMChat(LLM):
             temperature = self.DEFAULT_TEMPERATURE
         if request_uid is None:
             raise ValueError("request_uid must be provided for agen_kvcomm.")
+        logger.info(
+            "[MODE_EXECUTE:hf] node={} role={} request_uid={} mode={} max_tokens={} temperature={}",
+            getattr(self, "node_id", "?"),
+            getattr(self, "role", "?"),
+            request_uid,
+            mode,
+            max_tokens,
+            temperature,
+        )
         state = self.kv_engine.resolve_request_state(request_uid)
         preprocess_start = perf_counter() if mode == "kv_reuse" else None
 
@@ -1302,10 +1369,10 @@ class LLMChat(LLM):
             
             ph_cache_seq_len = _cache_seq_len(ph_cache)
             ph_ids_len = ph_cache_ids["input_ids"].shape[-1] if ph_cache_ids else 0
-            print(
-                f"[CACHE_READ] mode={mode}, ph_id={ph_id}, message_hash={hash(message)}, message_preview={_preview_message(message)}, ph_content_preview={ph_content_preview}, ph_cache_seq_len={ph_cache_seq_len}, ph_ids_len={ph_ids_len}, drop_num={drop_num}, real_len={real_len}",
-                flush=True,
-            )
+            # print(
+            #     f"[CACHE_READ] mode={mode}, ph_id={ph_id}, message_hash={hash(message)}, message_preview={_preview_message(message)}, ph_content_preview={ph_content_preview}, ph_cache_seq_len={ph_cache_seq_len}, ph_ids_len={ph_ids_len}, drop_num={drop_num}, real_len={real_len}",
+            #     flush=True,
+            # )
             
             meta.append(
                 {
@@ -1360,10 +1427,10 @@ class LLMChat(LLM):
                     else 0
                 )
                 seg_content_preview = _preview_token_ids(self.tokenizer, seg_ids)
-                print(
-                    f"[CACHE_REUSE_APPLY] ph_id={ph_id}, message_hash={hash(message)}, message_preview={_preview_message(message)}, seg_content_preview={seg_content_preview}, seg_cache_seq_len={seg_len}, seg_ids_len={seg_ids_len}",
-                    flush=True,
-                )
+                # print(
+                #     f"[CACHE_REUSE_APPLY] ph_id={ph_id}, message_hash={hash(message)}, message_preview={_preview_message(message)}, seg_content_preview={seg_content_preview}, seg_cache_seq_len={seg_len}, seg_ids_len={seg_ids_len}",
+                #     flush=True,
+                # )
 
         placeholder_indices: Dict[str, Tuple[int, int]] = {}
         for m in meta:

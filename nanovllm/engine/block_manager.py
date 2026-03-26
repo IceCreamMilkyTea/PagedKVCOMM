@@ -115,11 +115,15 @@ class BlockManager:
             self._allocate_block(block_id)
             block_table.append(block_id)
         elif len(seq) % self.block_size == 0:
-            assert last_block.hash == -1
-            token_ids = seq.block(seq.num_blocks-1)
-            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
-            h = self.compute_hash(token_ids, prefix)
-            last_block.update(h, token_ids)
-            self.hash_to_block_id[h] = last_block.block_id
+            # Reused cached blocks may already carry a finalized hash. Only
+            # finalize if this block has been treated as mutable (hash == -1).
+            if last_block.hash == -1:
+                token_ids = seq.block(seq.num_blocks-1)
+                prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+                h = self.compute_hash(token_ids, prefix)
+                last_block.update(h, token_ids)
+                self.hash_to_block_id[h] = last_block.block_id
         else:
-            assert last_block.hash == -1
+            # Partial block is being appended to; ensure it is marked mutable.
+            if last_block.hash != -1:
+                last_block.hash = -1

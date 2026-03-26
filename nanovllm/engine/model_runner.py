@@ -155,13 +155,13 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup
                 continue
-            for i in range(seq.num_cached_blocks, seq.num_blocks):
-                start = seq.block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
-                else:
-                    end = start + seq.last_block_num_tokens 
-                slot_mapping.extend(list(range(start, end)))
+            # Support non-block-aligned cached prefixes by mapping each uncached
+            # token position to its physical KV slot.
+            for pos in range(seq.num_cached_tokens, seqlen):
+                block_idx = pos // self.block_size
+                block_offset = pos % self.block_size
+                block_id = seq.block_table[block_idx]
+                slot_mapping.append(block_id * self.block_size + block_offset)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)

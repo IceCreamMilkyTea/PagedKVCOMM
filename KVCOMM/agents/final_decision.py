@@ -125,9 +125,7 @@ class FinalWriteCode(Node):
                     cond_prefix: str | None = None
 
                     if self.domain == "gsm8k" and info["role"] == "Programming Expert":
-                        answer = execute_code_get_return(
-                            info["output"].split("```python\n")[-1].split("\n```")[0]
-                        )
+                        answer = execute_code_get_return(info["output"])
                         if answer is None:
                             answer = "No variable is named answer."
                         cond_text = f"the answer is {answer}"
@@ -229,9 +227,7 @@ class FinalWriteCode(Node):
             for agent_id, info in spatial_info.items():
                 agent_output = info["output"]
                 if info["role"] == "Programming Expert":
-                    answer = execute_code_get_return(
-                        info["output"].split("```python\n")[-1].split("\n```")[0]
-                    )
+                    answer = execute_code_get_return(info["output"])
                     agent_output += f"\n the result is {answer}"
                 spatial_str += (
                     f"Agent {agent_id}, role is {info['role']}, output is:\n\n {agent_output}\n\n"
@@ -382,9 +378,7 @@ class FinalRefer(Node):
                     cond_prefix: str | None = None
 
                     if self.domain == "gsm8k" and info["role"] == "Programming Expert":
-                        answer = execute_code_get_return(
-                            info["output"].split("```python\n")[-1].split("\n```")[0]
-                        )
+                        answer = execute_code_get_return(info["output"])
                         if answer is None:
                             answer = "No variable is named answer."
                         cond_text = f"the answer is {answer}"
@@ -486,9 +480,7 @@ class FinalRefer(Node):
             for agent_id, info in spatial_info.items():
                 agent_output = info["output"]
                 if info["role"] == "Programming Expert":
-                    answer = execute_code_get_return(
-                        info["output"].split("```python\n")[-1].split("\n```")[0]
-                    )
+                    answer = execute_code_get_return(info["output"])
                     agent_output += f"\n the result is {answer}"
                 spatial_str += (
                     f"Agent {agent_id}, role is {info['role']}, output is:\n\n {agent_output}\n\n"

@@ -999,7 +999,15 @@ class KVCOMMEngine:
         entropy_eps: float = 1e-40,
         test_time: bool = False,
     ) -> Tuple[bool, List[int]]:
-        if len(anchor_kv_cache_list) in [0, 1]:
+        if len(anchor_kv_cache_list) == 0:
+            logger.info(
+                "[ANCHOR_PREDICT:hf] anchors=0 decision=dense_prefill reason=no_anchor_history"
+            )
+            return True, anchor_activated_list
+        if len(anchor_kv_cache_list) == 1:
+            logger.info(
+                "[ANCHOR_PREDICT:hf] anchors=1 decision=dense_prefill reason=single_anchor"
+            )
             return True, anchor_activated_list
 
         if test_time:
@@ -1058,6 +1066,18 @@ class KVCOMMEngine:
                     f"<cyan>Latency for Anchor prediction: {end_time - start_time} s</cyan>"
                 )
             return False, anchor_activated_list
+        if len(anchor_available) == 0:
+            logger.info(
+                "[ANCHOR_PREDICT:hf] anchors={} length_eligible=0 candidate_tokens={} decision=dense_prefill reason=no_length_eligible_anchor",
+                len(anchor_kv_cache_list),
+                k,
+            )
+        else:
+            logger.info(
+                "[ANCHOR_PREDICT:hf] anchors={} length_eligible=1 candidate_tokens={} decision=dense_prefill reason=single_length_eligible_anchor",
+                len(anchor_kv_cache_list),
+                k,
+            )
         logger.opt(colors=True).debug("<yellow>No available anchors to activate.</yellow>")
         return True, anchor_activated_list
 
