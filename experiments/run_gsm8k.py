@@ -105,6 +105,7 @@ def parse_args():
     parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
+    parser.add_argument("--use-local-reference", action="store_true", default=False, help="Use local (upstream agent) reference instead of global base for KV offset reconstruction.")
     args = parser.parse_args()
 
     if len(args.agent_names) != len(args.agent_nums):
