@@ -48,8 +48,8 @@ datasets/MMLU/
 *.env
 
 # Shell scripts 
-scripts/
-*.sh
+# scripts/
+# *.sh
 
 # OS
 .DS_Store
