@@ -20,6 +20,7 @@ class KVCommConfig:
     window_size: int = 5
     thread_pool_workers: int = 8
     worker_timeout: float = 30.0
+    use_local_reference: bool = False
 
     @classmethod
     def from_env(cls) -> "KVCommConfig":
@@ -30,6 +31,7 @@ class KVCommConfig:
             window_size=int(os.environ.get("WINDOW_SIZE", cls.window_size)),
             thread_pool_workers=int(os.environ.get("KVCOMM_THREAD_WORKERS", cls.thread_pool_workers)),
             worker_timeout=float(os.environ.get("KVCOMM_WORKER_TIMEOUT", cls.worker_timeout)),
+            use_local_reference=os.environ.get("USE_LOCAL_REFERENCE", "").lower() in ("1", "true", "yes"),
         ).validate()
 
     def apply_overrides(self, **overrides: Any) -> "KVCommConfig":

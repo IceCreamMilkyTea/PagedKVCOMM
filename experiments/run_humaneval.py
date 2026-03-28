@@ -3,7 +3,7 @@ import asyncio
 import copy
 import json
 import sys, os
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 sys.stdout.reconfigure(encoding='utf-8')
@@ -17,13 +17,14 @@ import torch
 
 from KVCOMM.graph.graph import Graph
 from KVCOMM.llm.config import KVCommConfig
+from KVCOMM.tools.coding.python_executor import PyExecutor
 from KVCOMM.tools.reader.readers import JSONLReader
 from KVCOMM.utils.globals import Time
 from KVCOMM.utils.log import configure_logging, logger
 from KVCOMM.utils.metrics import metrics_recorder
-from datasets.gsm8k_dataset import (
-    get_pred_value,
-    gsm_data_process
+from experiments.bench_utils import (
+    setup_method, reset_memory_tracking, get_peak_memory_mb,
+    collect_ttft_stats, clear_latency_json, save_benchmark_summary, print_summary,
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -49,8 +50,8 @@ def dataloader(data_list, batch_size, i_batch):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="KVCOMM Experiments on GSM8K")
-    parser.add_argument("--dataset_json", type=str, default="datasets/gsm8k/gsm8k.jsonl")
+    parser = argparse.ArgumentParser(description="KVCOMM Experiments on HumanEval")
+    parser.add_argument("--dataset_json", type=str, default="datasets/humaneval/humaneval-py.jsonl")
     parser.add_argument("--llm_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument(
         "--mode",
@@ -58,28 +59,23 @@ def parse_args():
         default="FullConnected",
         choices=["DirectAnswer", "FullConnected", "Random", "Chain", "Debate", "Layered", "Star"], help="The communication topology among agents."
     )
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size.")
-    parser.add_argument("--domain", type=str, default="gsm8k")
+    parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--domain", type=str, default="humaneval")
     parser.add_argument(
         "--agent_names",
         nargs="+",
         type=str,
-        default=["MathSolver"],
+        default=["CodeWriting"],
         help="List of agent names in the graph.",
     )
     parser.add_argument(
         "--agent_nums",
         nargs="+",
         type=int,
-        default=[3],
+        default=[5],
         help="List of agent counts corresponding to agent names.",
     )
-    parser.add_argument(
-        "--decision_method",
-        type=str,
-        default="FinalRefer",
-        help="Decision method for the graph.",
-    )
+    parser.add_argument("--decision_method", type=str, default="FinalRefer", help="Decision method for the graph.")
     parser.add_argument(
         "--execution_mode",
         type=str,
@@ -87,17 +83,29 @@ def parse_args():
         choices=["default", "allow_kv_reuse"],
         help="Execution strategy for the graph.",
     )
-    parser.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "result" / "gsm8k"), help="Directory to save the output results.")
-    parser.add_argument("--prefix", type=str, default="Q:\n", help="The prefix text for the input query, kept the same as the default dense prefill mode.")
+    parser.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "result" / "humaneval"), help="Directory to save the output results.")
+    parser.add_argument("--prefix", type=str, default="The task is:\n\n", help="The prefix text for the input query, kept the same as the default dense prefill mode.")
+    parser.add_argument(
+        "--method",
+        type=str,
+        default=None,
+        choices=["dense", "kvcomm", "paged_kvcomm"],
+        help="High-level method selector. Overrides --execution_mode and sets KVCOMM_PAGED env var.",
+    )
     parser.add_argument("--kv-threshold", type=float, default=None, help="Threshold for key-value memory usage.")
     parser.add_argument("--kv-max-anchor-num", type=int, default=None, help="Maximum number of anchors for key-value memory.")
     parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
-    args = parser.parse_args()
+    parser.add_argument("--use-local-reference", action="store_true", default=False, help="Use local (upstream agent) reference instead of global base for KV offset reconstruction.")
 
+    args = parser.parse_args()
     if len(args.agent_names) != len(args.agent_nums):
         parser.error("The number of agent names must match the number of agent counts.")
+
+    # --method overrides --execution_mode
+    if args.method is not None:
+        args.execution_mode = setup_method(args.method)
     return args
 
 
@@ -106,8 +114,7 @@ async def main():
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
     configure_logging(log_path=output_dir / "logs/log.txt")
-    dataset_raw = JSONLReader.parse_file(args.dataset_json)
-    dataset = gsm_data_process(dataset_raw)
+    dataset = JSONLReader.parse_file(args.dataset_json)
 
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
@@ -125,6 +132,7 @@ async def main():
             window_size=args.kv_window_size,
             thread_pool_workers=args.kv_thread_workers,
             worker_timeout=args.kv_worker_timeout,
+            use_local_reference=args.use_local_reference,
         )
     else:
         kv_config = KVCommConfig.from_env()
@@ -141,6 +149,11 @@ async def main():
     num_batches = int(len(dataset) / args.batch_size)
     total_solved, total_executed = 0, 0
 
+    # ── Benchmark instrumentation ──
+    clear_latency_json(str(output_dir))
+    reset_memory_tracking()
+    wall_start = time.time()
+
     for i_batch in range(num_batches):
         logger.opt(colors=True).info(f"<blue>[BATCH]</blue> {i_batch} {'-' * 40}")
         start_ts = time.time()
@@ -155,14 +168,15 @@ async def main():
             realized_graph = copy.deepcopy(graph)
             realized_graph.spatial_logits = graph.spatial_logits
             realized_graph.temporal_logits = graph.temporal_logits
-            task = record["task"]
+            task = record["prompt"]
+            tests = record["test"]
             input_dict = {"task": task, "_batch_index": i_batch}
 
             mode_kwargs = {}
             if args.execution_mode == "allow_kv_reuse":
                 mode_kwargs = {
                     "prefix": args.prefix,
-                    "output_dir": latency_target,
+                    "output_dir": latency_target
                 }
 
             tasks.append(
@@ -175,13 +189,7 @@ async def main():
                     )
                 )
             )
-            meta_info.append(
-                {
-                    "task": task,
-                    "step": record["step"],
-                    "answer": record["answer"],
-                }
-            )
+            meta_info.append({"task": task, "tests": tests})
 
         batch_results = await asyncio.gather(*tasks)
         results_by_task = {result.get("task"): result.get("answers", []) for result in batch_results}
@@ -189,31 +197,29 @@ async def main():
 
         for info in meta_info:
             task = info["task"]
-            true_answer = info["answer"]
+            tests = info["tests"]
             answers = results_by_task.get(task, [])
             response = answers if isinstance(answers, list) else [answers]
-
             if not response:
-                predicted = "0"
+                candidate = ""
             else:
-                predicted = await get_pred_value(response[0])
+                candidate = response[0]
+            if isinstance(candidate, str):
+                code = candidate.split("```python\n")[-1].split("\n```")[0]
+            else:
+                code = str(candidate)
 
-            try:
-                is_solved = float(predicted) == float(true_answer)
-            except Exception:
-                is_solved = False
-
+            is_solved, _, _ = PyExecutor().execute(code, [tests], timeout=100)
             total_solved += is_solved
             total_executed += 1
             accuracy = total_solved / total_executed
 
             updated_item = {
                 "Question": task,
-                "Answer": true_answer,
-                "Step": info["step"],
-                "Response": response,
-                "Attempt answer": predicted,
+                "Tests": tests,
+                "Attempt answer": code,
                 "Solved": bool(is_solved),
+                "Solution": code,
                 "Total solved": total_solved,
                 "Total executed": total_executed,
                 "Accuracy": accuracy,
@@ -229,6 +235,23 @@ async def main():
         logger.opt(colors=True).info(f"<blue>[ACCURACY]</blue> {accuracy:.4f}")
         metrics_recorder.log_cumulative(batch_index=i_batch)
 
+    # ── Save benchmark summary ──
+    wall_elapsed = time.time() - wall_start
+    method_name = args.method or ("kvcomm" if args.execution_mode == "allow_kv_reuse" else "dense")
+    ttft_stats = collect_ttft_stats(str(output_dir))
+    peak_mem = get_peak_memory_mb()
+    summary_path = save_benchmark_summary(
+        str(output_dir),
+        method=method_name,
+        benchmark="humaneval",
+        accuracy=total_solved / total_executed if total_executed else 0.0,
+        solved=total_solved,
+        total=total_executed,
+        elapsed_s=wall_elapsed,
+        peak_memory_mb=peak_mem,
+        ttft_stats=ttft_stats,
+    )
+    print_summary(summary_path)
 
 def get_kwargs(
     mode: Union[
@@ -272,7 +295,7 @@ def get_kwargs(
     if mode == "DirectAnswer":
         fixed_spatial_masks = [[0]]
         fixed_temporal_masks = [[0]]
-        node_kwargs = [{"role": "Programming Expert"}]
+        node_kwargs = [{"role": "Normal Programmer"}]
     elif mode == "FullConnected":
         fixed_spatial_masks = [[1 if i != j else 0 for i in range(N)] for j in range(N)]
         fixed_temporal_masks = [[1 for _ in range(N)] for _ in range(N)]

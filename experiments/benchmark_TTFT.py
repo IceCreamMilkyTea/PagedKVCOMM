@@ -1,7 +1,10 @@
 import argparse
 import asyncio
 import sys, os
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+# Enforce 512-token system prefix and 512-token outputs
+os.environ["IN_LENGTH"] = "512"
+os.environ["OUT_LENGTH"] = "512"
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 sys.stdout.reconfigure(encoding='utf-8')
@@ -9,17 +12,18 @@ import random
 import json
 import time
 from pathlib import Path
-from typing import List, Literal, Union
+from typing import List, Literal, Union, Dict, Any
 
 import numpy as np
 import torch
-
+import copy
 from KVCOMM.graph.graph import Graph
 from KVCOMM.llm.config import KVCommConfig
-from datasets.MMLU.download import download
-from datasets.mmlu_dataset import MMLUDataset
-from experiments.evaluate_mmlu import evaluate
 from KVCOMM.utils.log import configure_logging, logger
+from experiments.bench_utils import (
+    setup_method, reset_memory_tracking, get_peak_memory_mb,
+    collect_ttft_stats, clear_latency_json, save_benchmark_summary, print_summary,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -31,51 +35,129 @@ torch.cuda.manual_seed_all(SEED)
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="KVCOMM Experiments on MMLU")
+    parser = argparse.ArgumentParser(description="KVCOMM Experiments on TTFT Benchmark")
     parser.add_argument(
         "--mode",
         type=str,
         default="FullConnected",
-        choices=["DirectAnswer", "FullConnected", "Random", "Chain", "Debate", "Layered", "Star", "Mesh"], help="The communication topology among agents.",
+        choices=["DirectAnswer", "FullConnected", "Random", "Chain", "Debate", "Layered", "Star", "Mesh"],
+        help="The communication topology among agents.",
     )
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument(
         "--agent_names",
         nargs="+",
         type=str,
-        default=["AnalyzeAgent"],
+        default=["CopyMachine"],
+        help="List of agent names to include in the graph."
     )
     parser.add_argument(
         "--agent_nums",
         nargs="+",
         type=int,
         default=[5],
+        help="List of counts corresponding to each agent name."
     )
     parser.add_argument("--llm_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
-    parser.add_argument("--domain", type=str, default="mmlu")
-    parser.add_argument("--decision_method", type=str, default="FinalRefer", help="Decision method for the graph.")
+    parser.add_argument("--domain", type=str, default="COPY")
+    parser.add_argument("--decision_method", type=str, default=None)
     parser.add_argument(
         "--execution_mode",
         type=str,
-        default="default",
+        default="allow_kv_reuse",
         choices=["default", "allow_kv_reuse"],
         help="Execution strategy for the graph.",
     )
-    parser.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "result" / "mmlu"), help="Directory to save the output results.")
+    parser.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "result" / "TTFT_Benchmark"), help="Directory to save the output results.")
     parser.add_argument("--prefix", type=str, default="The task is:\n\n", help="The prefix text for the input query, kept the same as the default dense prefill mode.")
-    parser.add_argument("--kv-threshold", type=float, default=None, help="Threshold for key-value memory usage.")
+    parser.add_argument("--samples", type=int, default=100, help="Number of 1K-token samples")
+    parser.add_argument(
+        "--method",
+        type=str,
+        default=None,
+        choices=["dense", "kvcomm", "paged_kvcomm"],
+        help="High-level method selector. Overrides --execution_mode and sets KVCOMM_PAGED env var.",
+    )
+    parser.add_argument("--kv-threshold", type=float, default=1.0, help="Threshold for key-value memory usage.")
     parser.add_argument("--kv-max-anchor-num", type=int, default=20, help="Maximum number of anchors for key-value memory.")
-    parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
+    parser.add_argument("--kv-window-size", type=int, default=5, help="Window size for key-value memory update.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
+    parser.add_argument("--use-local-reference", action="store_true", default=False, help="Use local (upstream agent) reference instead of global base for KV offset reconstruction.")
 
     args = parser.parse_args()
     result_path = Path(args.output_dir)
     result_path.mkdir(parents=True, exist_ok=True)
     if len(args.agent_names) != len(args.agent_nums):
         parser.error("The number of agent names must match the number of agent counts.")
+
+    # --method overrides --execution_mode
+    if args.method is not None:
+        args.execution_mode = setup_method(args.method)
     return args
 
+def _make_random_token_sequence(length: int) -> str:
+    symbols = random.choices(["Δ", "Ω"], k=length)
+    return " ".join(symbols)
+
+
+async def evaluate(
+        graph: Graph,
+        *,
+        samples: int,
+        output_dir: str,
+        **kwargs
+        ) -> List[Dict[str, Any]]:
+
+    graph.spatial_logits.requires_grad_ = False
+    graph.temporal_logits.requires_grad_ = False
+
+    data = [{"task": _make_random_token_sequence(1000)} for _ in range(samples)]
+
+    all_results: List[Dict[str, Any]] = []
+    for i, input_dict in enumerate(data):
+        print(80*'-')
+
+        realized_graph = copy.deepcopy(graph)
+        realized_graph.spatial_logits = graph.spatial_logits
+        realized_graph.temporal_logits = graph.temporal_logits
+        tasks = [asyncio.create_task(realized_graph.arun(input_dict, **kwargs))]
+        raw_results = await asyncio.gather(*tasks)
+        all_results.extend(raw_results)
+    print("Done!")
+
+    try:
+        _write_per_agent_latency(output_dir)
+    except Exception as e:
+        logger.warning("Failed to write per-agent latency JSONs: {}", e)
+
+    return all_results
+
+
+def _write_per_agent_latency(output_dir: str) -> None:
+    latency_path = Path(output_dir) / "Latency.json"
+    if not latency_path.exists():
+        logger.warning("Latency.json not found at {}", str(latency_path))
+        return
+    try:
+        with open(latency_path, "r", encoding="utf-8") as f:
+            records = json.load(f)
+    except Exception as e:
+        logger.warning("Could not read Latency.json: {}", e)
+        return
+    by_agent: Dict[str, List[Dict[str, Any]]] = {}
+    for rec in records if isinstance(records, list) else []:
+        agent_id = rec.get("agent_id") or "unknown"
+        by_agent.setdefault(agent_id, []).append(rec)
+    out_dir = Path(output_dir) / "agent_latency"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for agent_id, items in by_agent.items():
+        agent_file = out_dir / f"agent_{agent_id}.json"
+        with open(agent_file, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False, indent=2)
+    combined = out_dir / "PerAgentLatency.json"
+    with open(combined, "w", encoding="utf-8") as f:
+        json.dump(by_agent, f, ensure_ascii=False, indent=2)
 
 async def main():
     args = parse_args()
@@ -89,50 +171,51 @@ async def main():
         window_size=args.kv_window_size,
         thread_pool_workers=args.kv_thread_workers,
         worker_timeout=args.kv_worker_timeout,
+        use_local_reference=args.use_local_reference,
     )
 
     graph = Graph(
         domain=args.domain,
         llm_name=args.llm_name,
         agent_names=agent_names,
-        decision_method=args.decision_method,
         kv_config=kv_config,
         **kwargs,
     )
 
-    download()
-    dataset_val = MMLUDataset("val")
-    limit_questions = 153
-    eval_kwargs = {}
-    if args.execution_mode == "allow_kv_reuse":
-        eval_kwargs = {
-            "prefix": args.prefix,
-            "output_dir": str(output_dir),
-        }
+    eval_kwargs = {
+        "prefix": args.prefix,
+        "output_dir": str(output_dir),
+    }
 
     configure_logging(log_path=output_dir / "logs/log.txt")
-    timestamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
-    score = await evaluate(
+
+    # ── Benchmark instrumentation ──
+    clear_latency_json(str(output_dir))
+    reset_memory_tracking()
+    wall_start = time.time()
+
+    _ = await evaluate(
         graph=graph,
-        dataset=dataset_val,
-        limit_questions=limit_questions,
-        eval_batch_size=args.batch_size,
         mode=args.execution_mode,
+        samples=args.samples,
         **eval_kwargs,
     )
-    logger.opt(colors=True).info("<blue>[MMLU SCORE]</blue> {:.4f}", score)
-    result_file = output_dir / f"{args.domain}_{args.llm_name}_{timestamp}.json"
-    result_file.touch(exist_ok=True)
-    payload = {
-        "score": score,
-        "execution_mode": args.execution_mode,
-        "agent_names": args.agent_names,
-        "agent_nums": args.agent_nums,
-        "timestamp": timestamp,
-    }
-    with open(result_file, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, indent=2)
-    logger.opt(colors=True).info("<blue>[RESULT SAVED]</blue> {}", str(result_file))
+
+    # ── Save benchmark summary ──
+    wall_elapsed = time.time() - wall_start
+    method_name = args.method or ("kvcomm" if args.execution_mode == "allow_kv_reuse" else "dense")
+    ttft_stats = collect_ttft_stats(str(output_dir))
+    peak_mem = get_peak_memory_mb()
+    summary_path = save_benchmark_summary(
+        str(output_dir),
+        method=method_name,
+        benchmark="TTFT_synthetic",
+        elapsed_s=wall_elapsed,
+        peak_memory_mb=peak_mem,
+        ttft_stats=ttft_stats,
+        extra={"samples": args.samples, "agent_nums": args.agent_nums},
+    )
+    print_summary(summary_path)
 
 
 def get_kwargs(

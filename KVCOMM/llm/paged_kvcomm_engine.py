@@ -478,6 +478,223 @@ class PagedKVCOMMEngine:
 
         return new_ph_blocks, base_ph_num_tokens, new_pf_blocks, base_pf_num_tokens
 
+    def offset_kv_cache_local_ref(
+        self,
+        agent_id: str,
+        ph_id: str,
+        message: str,
+        base_ph_block_table: List[int],
+        base_ph_num_tokens: int,
+        base_pf_block_table: List[int],
+        base_pf_num_tokens: int,
+        anchor_list: List[str],
+        temperature: float = 1.0,
+    ) -> Tuple[List[int], int, List[int], int]:
+        """Apply weighted cross-agent deltas using a local (upstream) reference.
+
+        Instead of reconstructing from global base:
+            KV(x|P_j) ≈ KV(x|base) + Σ wᵢ·Δ(base→Pᵢ)
+
+        This uses the closest upstream agent's KV as reference:
+            KV(x|P_j) ≈ KV(x|P_up) + Σ wᵢ·(Δ(base→Pᵢ) − Δ(base→P_up))
+
+        The upstream agent is selected as the agent (other than ``agent_id``)
+        whose delta is most similar to the current agent across the valid
+        anchors.  If no upstream agent delta is available, this falls back to
+        the standard ``offset_kv_cache`` (global base reference).
+
+        Returns:
+            (new_ph_block_table, ph_num_tokens, new_pf_block_table, pf_num_tokens)
+        """
+        ph_store = self.anchors.get(ph_id, {})
+        if not ph_store or not anchor_list:
+            self.increment_ref(base_ph_block_table)
+            self.increment_ref(base_pf_block_table)
+            return base_ph_block_table, base_ph_num_tokens, base_pf_block_table, base_pf_num_tokens
+
+        # Collect valid anchors (same criteria as offset_kv_cache).
+        valid_anchors: List[Tuple[str, PagedAnchorEntry]] = []
+        for msg in anchor_list:
+            entry = ph_store.get(msg)
+            if entry is None:
+                continue
+            delta_info = entry.agent_deltas.get(agent_id)
+            if delta_info is None:
+                continue
+            if entry.num_tokens < base_ph_num_tokens:
+                continue
+            ph_delta_tokens = int(delta_info.get("ph_delta_num_tokens", 0) or 0)
+            if ph_delta_tokens < base_ph_num_tokens:
+                continue
+            if base_pf_num_tokens > 0:
+                pf_delta_tokens = int(delta_info.get("pf_delta_num_tokens", 0) or 0)
+                if pf_delta_tokens < base_pf_num_tokens:
+                    continue
+            valid_anchors.append((msg, entry))
+
+        if not valid_anchors:
+            self.increment_ref(base_ph_block_table)
+            self.increment_ref(base_pf_block_table)
+            return base_ph_block_table, base_ph_num_tokens, base_pf_block_table, base_pf_num_tokens
+
+        # --- Find the best upstream agent ---
+        # Collect all agent IDs (excluding current) that have deltas in *every*
+        # valid anchor so we can compute cross-agent offsets consistently.
+        candidate_upstream_ids: Optional[set] = None
+        for _, entry in valid_anchors:
+            entry_agents = set()
+            for aid, d in entry.agent_deltas.items():
+                if aid == agent_id:
+                    continue
+                # Upstream must also cover the required token spans.
+                up_ph = int(d.get("ph_delta_num_tokens", 0) or 0)
+                if up_ph < base_ph_num_tokens:
+                    continue
+                if base_pf_num_tokens > 0:
+                    up_pf = int(d.get("pf_delta_num_tokens", 0) or 0)
+                    if up_pf < base_pf_num_tokens:
+                        continue
+                entry_agents.add(aid)
+            if candidate_upstream_ids is None:
+                candidate_upstream_ids = entry_agents
+            else:
+                candidate_upstream_ids &= entry_agents
+
+        if not candidate_upstream_ids:
+            # No common upstream agent available across all anchors → fallback.
+            logger.info(
+                "[LOCAL_REF] ph_id={} agent={} no common upstream agent, "
+                "falling back to global base offset",
+                ph_id, agent_id,
+            )
+            return self.offset_kv_cache(
+                agent_id=agent_id,
+                ph_id=ph_id,
+                message=message,
+                base_ph_block_table=base_ph_block_table,
+                base_ph_num_tokens=base_ph_num_tokens,
+                base_pf_block_table=base_pf_block_table,
+                base_pf_num_tokens=base_pf_num_tokens,
+                anchor_list=anchor_list,
+                temperature=temperature,
+            )
+
+        # Pick the upstream agent whose average delta is closest to the
+        # current agent's delta (smallest L2 distance across anchors).
+        base_ph_key, base_ph_val = self.read_kv_from_blocks(base_ph_block_table, base_ph_num_tokens)
+        base_pf_key, base_pf_val = self.read_kv_from_blocks(base_pf_block_table, base_pf_num_tokens)
+
+        best_upstream_id: Optional[str] = None
+        best_dist = float("inf")
+        for up_id in candidate_upstream_ids:
+            dist_acc = 0.0
+            for _, entry in valid_anchors:
+                cur_delta = entry.agent_deltas[agent_id]
+                up_delta = entry.agent_deltas[up_id]
+                cur_dk, _ = self.read_kv_from_blocks(
+                    cur_delta["ph_delta_blocks"], base_ph_num_tokens,
+                )
+                up_dk, _ = self.read_kv_from_blocks(
+                    up_delta["ph_delta_blocks"], base_ph_num_tokens,
+                )
+                dist_acc += (cur_dk[..., :base_ph_num_tokens, :] - up_dk[..., :base_ph_num_tokens, :]).norm().item()
+            if dist_acc < best_dist:
+                best_dist = dist_acc
+                best_upstream_id = up_id
+
+        if best_upstream_id is None:
+            # Should not happen given the check above, but guard anyway.
+            return self.offset_kv_cache(
+                agent_id=agent_id, ph_id=ph_id, message=message,
+                base_ph_block_table=base_ph_block_table, base_ph_num_tokens=base_ph_num_tokens,
+                base_pf_block_table=base_pf_block_table, base_pf_num_tokens=base_pf_num_tokens,
+                anchor_list=anchor_list, temperature=temperature,
+            )
+
+        logger.info(
+            "[LOCAL_REF] ph_id={} agent={} selected upstream={} dist={:.4f} "
+            "num_valid_anchors={}",
+            ph_id, agent_id, best_upstream_id, best_dist, len(valid_anchors),
+        )
+
+        # --- Compute similarity weights (same as global path) ---
+        sims_list = []
+        for _, entry in valid_anchors:
+            anchor_key = entry.ph_key_embedding[..., -base_ph_num_tokens:, :]
+            if anchor_key.device != base_ph_key.device:
+                anchor_key = anchor_key.to(base_ph_key.device, non_blocking=True)
+            sims_list.append((base_ph_key - anchor_key).norm(2, dim=-2))
+        sims = torch.stack(sims_list, dim=0)
+        weights = torch.softmax(-sims.float() / temperature, dim=0).unsqueeze(-2)
+
+        # --- Reconstruct local reference KV (base + upstream delta) ---
+        # Read upstream agent's delta from the first valid anchor to build the
+        # reference.  We use a weighted average of upstream deltas across all
+        # anchors (same weights) so the reference is consistent with the
+        # blending.
+        up_ph_delta_sum_k = torch.zeros_like(base_ph_key)
+        up_ph_delta_sum_v = torch.zeros_like(base_ph_val)
+        up_pf_delta_sum_k = torch.zeros_like(base_pf_key)
+        up_pf_delta_sum_v = torch.zeros_like(base_pf_val)
+
+        for i, (_, entry) in enumerate(valid_anchors):
+            up_delta = entry.agent_deltas[best_upstream_id]
+            dk, dv = self.read_kv_from_blocks(up_delta["ph_delta_blocks"], base_ph_num_tokens)
+            w = weights[i]
+            up_ph_delta_sum_k += w * dk[..., :base_ph_num_tokens, :]
+            up_ph_delta_sum_v += w * dv[..., :base_ph_num_tokens, :]
+            if base_pf_num_tokens > 0:
+                dk_pf, dv_pf = self.read_kv_from_blocks(up_delta["pf_delta_blocks"], base_pf_num_tokens)
+                up_pf_delta_sum_k += w * dk_pf
+                up_pf_delta_sum_v += w * dv_pf
+
+        # Local reference = base + upstream_delta
+        local_ref_ph_key = base_ph_key + up_ph_delta_sum_k.to(base_ph_key.dtype)
+        local_ref_ph_val = base_ph_val + up_ph_delta_sum_v.to(base_ph_val.dtype)
+        local_ref_pf_key = base_pf_key + up_pf_delta_sum_k.to(base_pf_key.dtype)
+        local_ref_pf_val = base_pf_val + up_pf_delta_sum_v.to(base_pf_val.dtype)
+
+        # --- Weighted cross-delta: Δ_cross = Δ_current − Δ_upstream ---
+        cross_ph_delta_k = torch.zeros_like(base_ph_key)
+        cross_ph_delta_v = torch.zeros_like(base_ph_val)
+        cross_pf_delta_k = torch.zeros_like(base_pf_key)
+        cross_pf_delta_v = torch.zeros_like(base_pf_val)
+
+        for i, (_, entry) in enumerate(valid_anchors):
+            cur_delta = entry.agent_deltas[agent_id]
+            up_delta = entry.agent_deltas[best_upstream_id]
+
+            cur_dk, cur_dv = self.read_kv_from_blocks(cur_delta["ph_delta_blocks"], base_ph_num_tokens)
+            up_dk, up_dv = self.read_kv_from_blocks(up_delta["ph_delta_blocks"], base_ph_num_tokens)
+            w = weights[i]
+            cross_ph_delta_k += w * (cur_dk[..., :base_ph_num_tokens, :] - up_dk[..., :base_ph_num_tokens, :])
+            cross_ph_delta_v += w * (cur_dv[..., :base_ph_num_tokens, :] - up_dv[..., :base_ph_num_tokens, :])
+
+            if base_pf_num_tokens > 0:
+                cur_dk_pf, cur_dv_pf = self.read_kv_from_blocks(cur_delta["pf_delta_blocks"], base_pf_num_tokens)
+                up_dk_pf, up_dv_pf = self.read_kv_from_blocks(up_delta["pf_delta_blocks"], base_pf_num_tokens)
+                cross_pf_delta_k += w * (cur_dk_pf - up_dk_pf)
+                cross_pf_delta_v += w * (cur_dv_pf - up_dv_pf)
+
+        # --- Apply cross-delta to local reference ---
+        new_ph_key = local_ref_ph_key + cross_ph_delta_k.to(local_ref_ph_key.dtype)
+        new_ph_val = local_ref_ph_val + cross_ph_delta_v.to(local_ref_ph_val.dtype)
+        new_ph_key[0] = base_ph_key[0]  # Keep layer 0 unchanged (KVCOMM convention)
+        new_ph_val[0] = base_ph_val[0]
+
+        new_ph_blocks = self.allocate_blocks_for_tokens(base_ph_num_tokens)
+        self.write_kv_to_blocks(new_ph_blocks, new_ph_key, new_ph_val, base_ph_num_tokens)
+
+        new_pf_key = local_ref_pf_key + cross_pf_delta_k.to(local_ref_pf_key.dtype)
+        new_pf_val = local_ref_pf_val + cross_pf_delta_v.to(local_ref_pf_val.dtype)
+        new_pf_key[0] = base_pf_key[0]
+        new_pf_val[0] = base_pf_val[0]
+
+        new_pf_blocks = self.allocate_blocks_for_tokens(base_pf_num_tokens)
+        self.write_kv_to_blocks(new_pf_blocks, new_pf_key, new_pf_val, base_pf_num_tokens)
+
+        return new_ph_blocks, base_ph_num_tokens, new_pf_blocks, base_pf_num_tokens
+
     def predict_as_anchor(
         self,
         ph_id: str,

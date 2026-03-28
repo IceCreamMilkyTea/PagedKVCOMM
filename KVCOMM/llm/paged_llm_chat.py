@@ -509,17 +509,32 @@ class PagedLLMChat(LLM):
             return None, 0, stats
 
         stats["offset_calls"] += 1
-        new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache(
-            agent_id=self.node_id,
-            ph_id=ph_id,
-            message=message_key,
-            base_ph_block_table=base_ph_blocks,
-            base_ph_num_tokens=ph_num,
-            base_pf_block_table=base_pf_blocks,
-            base_pf_num_tokens=pf_num,
-            anchor_list=anchor_messages,
-            temperature=1.0,
-        )
+        if self.config.use_local_reference:
+            new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache_local_ref(
+                agent_id=self.node_id,
+                ph_id=ph_id,
+                message=message_key,
+                base_ph_block_table=base_ph_blocks,
+                base_ph_num_tokens=ph_num,
+                base_pf_block_table=base_pf_blocks,
+                base_pf_num_tokens=pf_num,
+                anchor_list=anchor_messages,
+                temperature=1.0,
+            )
+            stats["local_reference"] = True
+        else:
+            new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache(
+                agent_id=self.node_id,
+                ph_id=ph_id,
+                message=message_key,
+                base_ph_block_table=base_ph_blocks,
+                base_ph_num_tokens=ph_num,
+                base_pf_block_table=base_pf_blocks,
+                base_pf_num_tokens=pf_num,
+                anchor_list=anchor_messages,
+                temperature=1.0,
+            )
+            stats["local_reference"] = False
 
         if new_ph_blocks != base_ph_blocks or new_pf_blocks != base_pf_blocks:
             stats["offset_effective"] += 1
@@ -1593,7 +1608,12 @@ class PagedLLMChat(LLM):
                         pf_blocks = base_block_table[pf_start_block:pf_end_block]
                         pf_num = pf_end - pf_start
 
-                        self.paged_kv_engine.offset_kv_cache(
+                        offset_fn = (
+                            self.paged_kv_engine.offset_kv_cache_local_ref
+                            if self.config.use_local_reference
+                            else self.paged_kv_engine.offset_kv_cache
+                        )
+                        offset_fn(
                             agent_id=self.node_id,
                             ph_id=ph_id,
                             message=message_key,

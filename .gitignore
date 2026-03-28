@@ -48,8 +48,12 @@ datasets/MMLU/
 *.env
 
 # Shell scripts 
+scripts/
 *.sh
 
 # OS
 .DS_Store
 Thumbs.db
+
+# GitHub
+.github/

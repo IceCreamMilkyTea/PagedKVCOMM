@@ -48,13 +48,27 @@ class RotaryEmbedding(nn.Module):
         return query, key
 
 
-@lru_cache(1)
+@lru_cache(maxsize=8)
+def _get_rope_cached(
+    head_size: int,
+    rotary_dim: int,
+    max_position: int,
+    base: float,
+    rope_scaling_key: tuple | None = None,
+):
+    return RotaryEmbedding(head_size, rotary_dim, max_position, base)
+
+
 def get_rope(
     head_size: int,
     rotary_dim: int,
     max_position: int,
     base: float,
-    rope_scaling: tuple | None = None,
+    rope_scaling=None,
 ):
-    rotary_emb = RotaryEmbedding(head_size, rotary_dim, max_position, base)
-    return rotary_emb
+    # lru_cache requires hashable args; convert dict to a sorted tuple of items
+    if isinstance(rope_scaling, dict):
+        rope_scaling_key = tuple(sorted(rope_scaling.items()))
+    else:
+        rope_scaling_key = rope_scaling
+    return _get_rope_cached(head_size, rotary_dim, max_position, base, rope_scaling_key)
