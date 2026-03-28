@@ -489,7 +489,7 @@ class PagedKVCOMMEngine:
         base_pf_num_tokens: int,
         anchor_list: List[str],
         temperature: float = 1.0,
-    ) -> Tuple[List[int], int, List[int], int]:
+    ) -> Tuple[List[int], int, List[int], int, Dict[str, Any]]:
         """Apply weighted cross-agent deltas using a local (upstream) reference.
 
         Instead of reconstructing from global base:
@@ -504,13 +504,23 @@ class PagedKVCOMMEngine:
         the standard ``offset_kv_cache`` (global base reference).
 
         Returns:
-            (new_ph_block_table, ph_num_tokens, new_pf_block_table, pf_num_tokens)
+            (new_ph_block_table, ph_num_tokens, new_pf_block_table, pf_num_tokens, local_ref_info)
+            local_ref_info keys:
+              - local_ref_used (bool): True if local reference was applied
+              - upstream_agent_id (str|None): selected upstream agent
+              - upstream_dist (float): L2 distance to upstream
+              - fallback_reason (str|None): reason if fell back to global base
+              - num_candidate_upstreams (int): number of candidate upstream agents
         """
         ph_store = self.anchors.get(ph_id, {})
         if not ph_store or not anchor_list:
             self.increment_ref(base_ph_block_table)
             self.increment_ref(base_pf_block_table)
-            return base_ph_block_table, base_ph_num_tokens, base_pf_block_table, base_pf_num_tokens
+            return (base_ph_block_table, base_ph_num_tokens,
+                    base_pf_block_table, base_pf_num_tokens,
+                    {"local_ref_used": False, "upstream_agent_id": None,
+                     "upstream_dist": 0.0, "fallback_reason": "no_anchors_or_anchor_list",
+                     "num_candidate_upstreams": 0})
 
         # Collect valid anchors (same criteria as offset_kv_cache).
         valid_anchors: List[Tuple[str, PagedAnchorEntry]] = []
@@ -535,7 +545,11 @@ class PagedKVCOMMEngine:
         if not valid_anchors:
             self.increment_ref(base_ph_block_table)
             self.increment_ref(base_pf_block_table)
-            return base_ph_block_table, base_ph_num_tokens, base_pf_block_table, base_pf_num_tokens
+            return (base_ph_block_table, base_ph_num_tokens,
+                    base_pf_block_table, base_pf_num_tokens,
+                    {"local_ref_used": False, "upstream_agent_id": None,
+                     "upstream_dist": 0.0, "fallback_reason": "no_valid_anchors",
+                     "num_candidate_upstreams": 0})
 
         # --- Find the best upstream agent ---
         # Collect all agent IDs (excluding current) that have deltas in *every*
@@ -567,7 +581,7 @@ class PagedKVCOMMEngine:
                 "falling back to global base offset",
                 ph_id, agent_id,
             )
-            return self.offset_kv_cache(
+            ph, phn, pf, pfn = self.offset_kv_cache(
                 agent_id=agent_id,
                 ph_id=ph_id,
                 message=message,
@@ -578,6 +592,10 @@ class PagedKVCOMMEngine:
                 anchor_list=anchor_list,
                 temperature=temperature,
             )
+            return (ph, phn, pf, pfn,
+                    {"local_ref_used": False, "upstream_agent_id": None,
+                     "upstream_dist": 0.0, "fallback_reason": "no_common_upstream",
+                     "num_candidate_upstreams": 0})
 
         # Pick the upstream agent whose average delta is closest to the
         # current agent's delta (smallest L2 distance across anchors).
@@ -604,12 +622,16 @@ class PagedKVCOMMEngine:
 
         if best_upstream_id is None:
             # Should not happen given the check above, but guard anyway.
-            return self.offset_kv_cache(
+            ph, phn, pf, pfn = self.offset_kv_cache(
                 agent_id=agent_id, ph_id=ph_id, message=message,
                 base_ph_block_table=base_ph_block_table, base_ph_num_tokens=base_ph_num_tokens,
                 base_pf_block_table=base_pf_block_table, base_pf_num_tokens=base_pf_num_tokens,
                 anchor_list=anchor_list, temperature=temperature,
             )
+            return (ph, phn, pf, pfn,
+                    {"local_ref_used": False, "upstream_agent_id": None,
+                     "upstream_dist": 0.0, "fallback_reason": "no_best_upstream",
+                     "num_candidate_upstreams": len(candidate_upstream_ids)})
 
         logger.info(
             "[LOCAL_REF] ph_id={} agent={} selected upstream={} dist={:.4f} "
@@ -693,7 +715,11 @@ class PagedKVCOMMEngine:
         new_pf_blocks = self.allocate_blocks_for_tokens(base_pf_num_tokens)
         self.write_kv_to_blocks(new_pf_blocks, new_pf_key, new_pf_val, base_pf_num_tokens)
 
-        return new_ph_blocks, base_ph_num_tokens, new_pf_blocks, base_pf_num_tokens
+        return (new_ph_blocks, base_ph_num_tokens, new_pf_blocks, base_pf_num_tokens,
+                {"local_ref_used": True, "upstream_agent_id": best_upstream_id,
+                 "upstream_dist": best_dist,
+                 "fallback_reason": None,
+                 "num_candidate_upstreams": len(candidate_upstream_ids)})
 
     def predict_as_anchor(
         self,

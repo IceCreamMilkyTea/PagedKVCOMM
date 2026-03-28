@@ -27,6 +27,8 @@ class RequestMetricsRecorder:
         self._requests: Dict[str, Dict[str, Any]] = {}
         self._total_calls: int = 0
         self._total_reuse_calls: int = 0
+        self._total_local_ref_calls: int = 0
+        self._total_local_ref_used: int = 0
         self._ttft_stats: Dict[str, Dict[str, float]] = {}
 
     def start_request(
@@ -46,6 +48,8 @@ class RequestMetricsRecorder:
                 "agents": [],
                 "kv_reuse_count": 0,
                 "total_count": 0,
+                "local_ref_calls": 0,
+                "local_ref_used": 0,
             }
 
     def record_agent_output(
@@ -71,6 +75,8 @@ class RequestMetricsRecorder:
                     "agents": [],
                     "kv_reuse_count": 0,
                     "total_count": 0,
+                    "local_ref_calls": 0,
+                    "local_ref_used": 0,
                 },
             )
 
@@ -99,6 +105,13 @@ class RequestMetricsRecorder:
             request_entry["kv_reuse_count"] = sum(
                 1 for entry in agents_list if entry.get("mode") == "kv_reuse"
             )
+
+            # Track local reference usage from reuse_stats metadata
+            reuse_stats = (generation.metadata or {}).get("reuse_stats", {})
+            if reuse_stats.get("local_reference"):
+                request_entry["local_ref_calls"] = request_entry.get("local_ref_calls", 0) + 1
+                if reuse_stats.get("local_ref_used"):
+                    request_entry["local_ref_used"] = request_entry.get("local_ref_used", 0) + 1
 
 
             stats = self._ttft_stats.setdefault(
@@ -153,6 +166,9 @@ class RequestMetricsRecorder:
             kv_reuse = request_entry.get("kv_reuse_count", 0)
             total = request_entry.get("total_count", 0)
             reuse_rate = (kv_reuse / total) if total else 0.0
+            local_ref_calls = request_entry.get("local_ref_calls", 0)
+            local_ref_used = request_entry.get("local_ref_used", 0)
+            local_ref_rate = (local_ref_used / local_ref_calls) if local_ref_calls else 0.0
 
             payload = {
                 "request_uid": request_uid,
@@ -162,6 +178,9 @@ class RequestMetricsRecorder:
                 "reuse_rate": reuse_rate,
                 "kv_reuse_count": kv_reuse,
                 "total_agents": total,
+                "local_ref_calls": local_ref_calls,
+                "local_ref_used": local_ref_used,
+                "local_ref_rate": local_ref_rate,
             }
             logger.opt(colors=True).info(
                 "<magenta>[REQUEST REUSE]</magenta> {}",
@@ -170,6 +189,8 @@ class RequestMetricsRecorder:
 
             self._total_calls += total
             self._total_reuse_calls += kv_reuse
+            self._total_local_ref_calls += local_ref_calls
+            self._total_local_ref_used += local_ref_used
             return reuse_rate
 
     def log_cumulative(self, *, batch_index: Optional[int]) -> float:
@@ -180,11 +201,19 @@ class RequestMetricsRecorder:
             else:
                 cumulative = self._total_reuse_calls / self._total_calls
 
+            if self._total_local_ref_calls == 0:
+                cumulative_local_ref = 0.0
+            else:
+                cumulative_local_ref = self._total_local_ref_used / self._total_local_ref_calls
+
             payload = {
                 "batch_index": batch_index,
                 "cumulative_reuse_rate": cumulative,
                 "kv_reuse_calls": self._total_reuse_calls,
                 "total_agent_calls": self._total_calls,
+                "cumulative_local_ref_rate": cumulative_local_ref,
+                "local_ref_calls": self._total_local_ref_calls,
+                "local_ref_used": self._total_local_ref_used,
             }
             logger.opt(colors=True).info(
                 "<yellow>[CUMULATIVE REUSE]</yellow> {}",

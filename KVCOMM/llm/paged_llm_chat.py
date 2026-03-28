@@ -510,7 +510,7 @@ class PagedLLMChat(LLM):
 
         stats["offset_calls"] += 1
         if self.config.use_local_reference:
-            new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache_local_ref(
+            new_ph_blocks, _, new_pf_blocks, _, local_ref_info = self.paged_kv_engine.offset_kv_cache_local_ref(
                 agent_id=self.node_id,
                 ph_id=ph_id,
                 message=message_key,
@@ -522,6 +522,9 @@ class PagedLLMChat(LLM):
                 temperature=1.0,
             )
             stats["local_reference"] = True
+            stats["local_ref_used"] = local_ref_info.get("local_ref_used", False)
+            stats["local_ref_upstream_agent"] = local_ref_info.get("upstream_agent_id")
+            stats["local_ref_fallback_reason"] = local_ref_info.get("fallback_reason")
         else:
             new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache(
                 agent_id=self.node_id,
@@ -535,6 +538,9 @@ class PagedLLMChat(LLM):
                 temperature=1.0,
             )
             stats["local_reference"] = False
+            stats["local_ref_used"] = False
+            stats["local_ref_upstream_agent"] = None
+            stats["local_ref_fallback_reason"] = None
 
         if new_ph_blocks != base_ph_blocks or new_pf_blocks != base_pf_blocks:
             stats["offset_effective"] += 1
@@ -913,6 +919,10 @@ class PagedLLMChat(LLM):
                 "num_blocks": 0,
                 "anchor_set_count": 0,
                 "anchor_skip_reasons": {},
+                "local_reference": False,
+                "local_ref_used": False,
+                "local_ref_upstream_agent": None,
+                "local_ref_fallback_reason": None,
             }
 
             def _record_anchor_skip(reason: str) -> None:
@@ -1179,6 +1189,10 @@ class PagedLLMChat(LLM):
                 "offset_effective": reuse_stats["offset_effective"],
                 "anchor_set_count": reuse_stats["anchor_set_count"],
                 "anchor_skip_reasons": reuse_stats["anchor_skip_reasons"],
+                "local_reference": reuse_stats["local_reference"],
+                "local_ref_used": reuse_stats["local_ref_used"],
+                "local_ref_upstream_agent": reuse_stats["local_ref_upstream_agent"],
+                "local_ref_fallback_reason": reuse_stats["local_ref_fallback_reason"],
             })
 
             if pinned_block_table:
