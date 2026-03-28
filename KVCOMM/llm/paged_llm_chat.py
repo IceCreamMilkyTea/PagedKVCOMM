@@ -1009,6 +1009,10 @@ class PagedLLMChat(LLM):
                 reuse_stats["anchor_candidates"] = offset_stats["anchor_candidates"]
                 reuse_stats["offset_calls"] = offset_stats["offset_calls"]
                 reuse_stats["offset_effective"] = offset_stats["offset_effective"]
+                reuse_stats["local_reference"] = offset_stats.get("local_reference", False)
+                reuse_stats["local_ref_used"] = offset_stats.get("local_ref_used", False)
+                reuse_stats["local_ref_upstream_agent"] = offset_stats.get("local_ref_upstream_agent")
+                reuse_stats["local_ref_fallback_reason"] = offset_stats.get("local_ref_fallback_reason")
                 if not offset_stats["offset_applied"]:
                     reason = offset_stats.get("fallback_reason", "unknown")
                     _record_anchor_skip(f"kv_reuse_fallback:{reason}")
