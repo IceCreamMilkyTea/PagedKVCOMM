@@ -1439,7 +1439,8 @@ class LLMChat(LLM):
                 start,
                 start + _cache_seq_len(m["ph_cache"]) - m["drop_num"],
             )
-
+        # template merging: s^(t)_m = [ p_{m,0}, φ^(t)_{m,1}, p_{m,1}, φ^(t)_{m,2}, p_{m,2}, ..., φ^(t)_{m,i}, p_{m,i}]
+        
         seg_cache_list = [r[1] for r in results_sorted]
         merged_prefix_kv.concat_(seg_cache_list)
         seg_ids_list = [r[2] for r in results_sorted]

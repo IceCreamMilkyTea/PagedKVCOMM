@@ -884,7 +884,7 @@ class PagedLLMChat(LLM):
                 max_tokens,
                 temperature,
             )
-            preprocess_start = perf_counter()
+            preprocess_start = perf_counter() if mode == "kv_reuse" else None
 
             message = messages[0] if isinstance(messages, list) else messages
             message_key = self._message_cache_key(message)
@@ -993,7 +993,9 @@ class PagedLLMChat(LLM):
                     )
 
             # Generate through nano-vllm engine
-            preprocess_latency = perf_counter() - preprocess_start
+            preprocess_latency = 0.0
+            if preprocess_start is not None:
+                preprocess_latency = max(0.0, perf_counter() - preprocess_start)
             completion_ids, ttft, seq = self._generate_tokens(
                 token_ids,
                 max_tokens,
@@ -1003,7 +1005,10 @@ class PagedLLMChat(LLM):
             )
             pinned_block_table = list(getattr(seq, "_pinned_block_table", []) or [])
 
-            total_ttft = ttft + preprocess_latency
+            generation_ttft = ttft
+            total_ttft = ttft
+            if preprocess_start is not None:
+                total_ttft += preprocess_latency
 
             # Block table now contains all KV blocks for this generation
             block_table = list(getattr(seq, "_block_table_snapshot", list(seq.block_table)))
@@ -1141,6 +1146,9 @@ class PagedLLMChat(LLM):
                 "placeholder_ids": list(placeholder_info_for_anchor.keys()),
                 "reuse_stats": reuse_stats,
             }
+            if preprocess_start is not None:
+                metadata["preprocess_latency"] = preprocess_latency
+                metadata["generation_ttft"] = generation_ttft
             if request_uid:
                 metadata["request_uid"] = request_uid
             if agent_id:
@@ -1154,6 +1162,8 @@ class PagedLLMChat(LLM):
                 "timestamp": time.time(),
                 "mode": mode,
                 "ttft": float(total_ttft),
+                "generation_ttft": float(generation_ttft),
+                "preprocess_latency": float(preprocess_latency) if preprocess_start is not None else None,
                 "request_uid": request_uid,
                 "agent_id": agent_id,
                 "message": message_key if message else None,
@@ -1533,7 +1543,7 @@ class PagedLLMChat(LLM):
         min_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         request_uid: Optional[str] = None,
-        mode: str = "kv_reuse",
+        mode: str = "dense_prefill",
         agent_id: Optional[str] = None,
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
@@ -1571,7 +1581,7 @@ class PagedLLMChat(LLM):
         )
 
         # ── Run 1: kv_reuse (prefix blocks may be cached by BlockManager hash) ──
-        preprocess_start = perf_counter()
+        preprocess_start = perf_counter() if mode == "kv_reuse" else None
 
         # Apply anchor deltas for kv_reuse if applicable
         if placeholder_info:
@@ -1607,7 +1617,9 @@ class PagedLLMChat(LLM):
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        preprocess_latency = perf_counter() - preprocess_start
+        preprocess_latency = 0.0
+        if preprocess_start is not None:
+            preprocess_latency = max(0.0, perf_counter() - preprocess_start)
 
         # KV-reuse generation (prefix cached → fast)
         if torch.cuda.is_available():
@@ -1617,15 +1629,19 @@ class PagedLLMChat(LLM):
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        kvcomm_ttft_value = kvcomm_gen_ttft + preprocess_latency
-        kvcomm_e2e_latency = perf_counter() - preprocess_start
+        kvcomm_ttft_value = kvcomm_gen_ttft
+        kvcomm_e2e_latency = 0.0
+        if preprocess_start is not None:
+            kvcomm_ttft_value = kvcomm_gen_ttft + preprocess_latency
+            kvcomm_e2e_latency = perf_counter() - preprocess_start
 
         safe_msg = _escape_loguru_markup(str(message))
-        logger.opt(colors=True).info(
-            f"<green>Agent {self.node_id} Role {self.role} Message {safe_msg} "
-            f"KVCOMM(Paged) E2E Latency: {kvcomm_e2e_latency:.4f}s "
-            f"TTFT: {kvcomm_ttft_value:.4f}s (Preprocess: {preprocess_latency:.4f}s)</green>",
-        )
+        if mode == "kv_reuse" and preprocess_start is not None:
+            logger.opt(colors=True).info(
+                f"<green>Agent {self.node_id} Role {self.role} Message {safe_msg} "
+                f"KVCOMM(Paged) E2E Latency: {kvcomm_e2e_latency:.4f}s "
+                f"TTFT: {kvcomm_ttft_value:.4f}s (Preprocess: {preprocess_latency:.4f}s)</green>",
+            )
 
         # ── Run 2: dense_prefill (full prefill, no block reuse) ──
         # Clear the block manager's cached hash table to force full recompute
@@ -1648,15 +1664,14 @@ class PagedLLMChat(LLM):
         )
 
         # ── Comparison ──
-        if kvcomm_ttft_value > 0:
+        ttft_value = dense_prefill_ttft
+        if mode == "kv_reuse" and preprocess_start is not None and kvcomm_ttft_value > 0:
             ratio = dense_prefill_ttft / kvcomm_ttft_value
             logger.opt(colors=True).info(
                 f"<green>Agent {self.node_id} Role {self.role} Message {safe_msg} "
                 f"KVCOMM(Paged) is {ratio:.2f}x faster than Dense Prefill in TTFT</green>",
             )
             ttft_value = kvcomm_ttft_value
-        else:
-            ttft_value = dense_prefill_ttft
 
         # ── Post-generation: anchor bookkeeping on the kv_reuse result ──
         block_table = list(kvcomm_seq.block_table)
@@ -1681,9 +1696,10 @@ class PagedLLMChat(LLM):
         # ── Build metadata and latency record ──
         metadata: Dict[str, Any] = {
             "placeholder_ids": list(placeholder_info.keys()),
-            "preprocess_latency": preprocess_latency,
-            "generation_ttft": ttft_value - preprocess_latency,
         }
+        if preprocess_start is not None:
+            metadata["preprocess_latency"] = preprocess_latency
+            metadata["generation_ttft"] = ttft_value - preprocess_latency
         if request_uid:
             metadata["request_uid"] = request_uid
         if agent_id:
@@ -1698,8 +1714,8 @@ class PagedLLMChat(LLM):
             "mode": mode,
             "backend": "paged",
             "ttft": float(ttft_value),
-            "generation_ttft": float(metadata["generation_ttft"]),
-            "preprocess_latency": float(preprocess_latency),
+            "generation_ttft": float(metadata["generation_ttft"]) if "generation_ttft" in metadata else None,
+            "preprocess_latency": float(preprocess_latency) if preprocess_start is not None else None,
             "dense_prefill_ttft": float(dense_prefill_ttft),
             "kvcomm_end_to_end_latency": float(kvcomm_e2e_latency),
             "dense_end_to_end_latency": float(dense_e2e_latency),
