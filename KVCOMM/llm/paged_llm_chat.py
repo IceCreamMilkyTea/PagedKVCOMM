@@ -394,6 +394,7 @@ class PagedLLMChat(LLM):
         scheduler.add(seq)
 
         ttft = None
+        prefill_latency = 0.0
         start_time = perf_counter()
         block_table_snapshot: List[int] = list(seq.block_table)
         num_tokens_snapshot: int = len(seq)
@@ -401,6 +402,13 @@ class PagedLLMChat(LLM):
 
         while not seq.is_finished:
             seqs, is_prefill = scheduler.schedule()
+
+            # Capture prefill end time right before the first decode forward pass
+            if prefill_latency == 0.0 and not is_prefill:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                prefill_latency = perf_counter() - start_time
+
             token_ids_out = self.engine.model_runner.call("run", seqs, is_prefill)
             # Pin the terminal step blocks before scheduler.postprocess deallocates seq.
             for sched_seq, token_id in zip(seqs, token_ids_out):
@@ -418,6 +426,7 @@ class PagedLLMChat(LLM):
             num_tokens_snapshot = len(seq)
             scheduler.postprocess(seqs, token_ids_out)
 
+            # Capture TTFT after the first decode forward pass completes
             if ttft is None and not is_prefill:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -431,7 +440,7 @@ class PagedLLMChat(LLM):
         setattr(seq, "_num_tokens_snapshot", num_tokens_snapshot)
         setattr(seq, "_pinned_block_table", pinned_block_table)
 
-        return seq.completion_token_ids, ttft, seq
+        return seq.completion_token_ids, ttft, prefill_latency, seq
 
     def _prepare_kv_reuse_prefix_blocks(
         self,
@@ -671,7 +680,7 @@ class PagedLLMChat(LLM):
         if temperature is None:
             temperature = self.DEFAULT_TEMPERATURE
 
-        completion_ids, ttft, seq = self._generate_tokens(token_ids, max_tokens, temperature)
+        completion_ids, *_ = self._generate_tokens(token_ids, max_tokens, temperature)
         return self.tokenizer.decode(completion_ids, skip_special_tokens=True)
 
     async def agen(
@@ -703,7 +712,7 @@ class PagedLLMChat(LLM):
                 safe_prompt,
             )
 
-            completion_ids, ttft, seq = self._generate_tokens(token_ids, max_tokens, temperature)
+            completion_ids, ttft, _prefill_lat, seq = self._generate_tokens(token_ids, max_tokens, temperature)
             response_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
 
             safe_resp = _escape_loguru_markup(response_text)
@@ -996,7 +1005,7 @@ class PagedLLMChat(LLM):
             preprocess_latency = 0.0
             if preprocess_start is not None:
                 preprocess_latency = max(0.0, perf_counter() - preprocess_start)
-            completion_ids, ttft, seq = self._generate_tokens(
+            completion_ids, ttft, prefill_latency, seq = self._generate_tokens(
                 token_ids,
                 max_tokens,
                 temperature,
@@ -1005,10 +1014,13 @@ class PagedLLMChat(LLM):
             )
             pinned_block_table = list(getattr(seq, "_pinned_block_table", []) or [])
 
-            generation_ttft = ttft
+            # Align with HF backend: preprocess_latency includes engine prefill,
+            # generation_ttft is decode-only (ttft minus prefill).
+            preprocess_latency += prefill_latency
+            generation_ttft = max(0.0, ttft - prefill_latency)
             total_ttft = ttft
             if preprocess_start is not None:
-                total_ttft += preprocess_latency
+                total_ttft = preprocess_latency + generation_ttft
 
             # Block table now contains all KV blocks for this generation
             block_table = list(getattr(seq, "_block_table_snapshot", list(seq.block_table)))
@@ -1129,10 +1141,57 @@ class PagedLLMChat(LLM):
             # Store response block info for future reuse
             mem = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
             resp_blocks = mem.setdefault("response_blocks", {})
+            resp_start_block = prompt_num_tokens // self.paged_kv_engine.block_size
+            response_block_table = block_table[resp_start_block:]
+            response_num_tokens = total_num_tokens - prompt_num_tokens
             resp_blocks.setdefault(message_key, []).append({
-                "block_table": block_table[prompt_num_tokens // self.paged_kv_engine.block_size:],
-                "num_tokens": total_num_tokens - prompt_num_tokens,
+                "block_table": response_block_table,
+                "num_tokens": response_num_tokens,
             })
+
+            # ── Response anchor prediction (mirrors HF gpt_chat.py logic) ──
+            response_anchor_key = f"agent_{self.node_id}_current"
+            resp_anchor_messages = list(
+                self.paged_kv_engine.anchors.get(response_anchor_key, {}).keys()
+            )
+            resp_info_bucket = PagedLLMChat._anchor_info_dict.setdefault(response_anchor_key, {})
+            resp_global_bucket = PagedLLMChat._global_anchor_info_dict.setdefault(response_anchor_key, {})
+
+            if response_block_table and response_num_tokens > 0:
+                resp_prob, resp_activated = self.paged_kv_engine.predict_as_anchor(
+                    ph_id=response_anchor_key,
+                    candidate_block_table=response_block_table,
+                    candidate_num_tokens=response_num_tokens,
+                    anchor_messages=resp_anchor_messages,
+                    top_p=0.9,
+                    entropy_threshold=self.config.threshold,
+                    max_compare_anchors=self.config.max_anchor_num,
+                )
+            else:
+                resp_prob, resp_activated = True, []
+
+            safe_msg = _escape_loguru_markup(message)
+            reuse_label = "REUSABLE" if not resp_prob else "NEW_ANCHOR"
+            logger.opt(colors=True).info(
+                f"<magenta>[RESPONSE_ANCHOR:paged] Agent {self.node_id} Role {self.role} | {reuse_label} | anchors={len(resp_anchor_messages)} | Message {safe_msg}</magenta>",
+            )
+
+            if not resp_prob:
+                # Reusable — update activation counts
+                for idx, anchor_msg_key in enumerate(resp_anchor_messages):
+                    if idx >= len(resp_activated):
+                        break
+                    resp_info_bucket[anchor_msg_key] = resp_activated[idx]
+                    bucket_entry = resp_global_bucket.setdefault(anchor_msg_key, [0, 0])
+                    bucket_entry[0] = resp_activated[idx]
+            else:
+                # New anchor — only record the flag; do NOT register_base_anchor here.
+                # Registering without agent deltas causes has_active_anchor to force
+                # dense prefill for all agents that haven't stored a delta yet.
+                # The actual anchor (with deltas) will be created by set_anchor
+                # during the next dense_prefill pass, matching HF gpt_chat.py behavior.
+                resp_info_bucket[message_key] = 0
+                resp_global_bucket[message_key] = [0, response_num_tokens]
 
             # Decode response
             response_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
@@ -1624,15 +1683,17 @@ class PagedLLMChat(LLM):
         # KV-reuse generation (prefix cached → fast)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        kvcomm_completion_ids, kvcomm_gen_ttft, kvcomm_seq = self._generate_tokens(
+        kvcomm_completion_ids, kvcomm_raw_ttft, kvcomm_prefill_lat, kvcomm_seq = self._generate_tokens(
             token_ids, max_tokens, temperature,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        kvcomm_ttft_value = kvcomm_gen_ttft
+        # Align with HF backend: fold engine prefill into preprocess_latency
+        preprocess_latency += kvcomm_prefill_lat
+        kvcomm_gen_ttft = max(0.0, kvcomm_raw_ttft - kvcomm_prefill_lat)
+        kvcomm_ttft_value = preprocess_latency + kvcomm_gen_ttft
         kvcomm_e2e_latency = 0.0
         if preprocess_start is not None:
-            kvcomm_ttft_value = kvcomm_gen_ttft + preprocess_latency
             kvcomm_e2e_latency = perf_counter() - preprocess_start
 
         safe_msg = _escape_loguru_markup(str(message))
@@ -1649,7 +1710,7 @@ class PagedLLMChat(LLM):
             torch.cuda.synchronize()
 
         dense_start = perf_counter()
-        dense_completion_ids, dense_gen_ttft, dense_seq = self._generate_tokens(
+        dense_completion_ids, dense_gen_ttft, _dense_prefill_lat, dense_seq = self._generate_tokens(
             token_ids, max_tokens, temperature,
         )
         if torch.cuda.is_available():

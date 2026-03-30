@@ -94,6 +94,7 @@ def parse_args():
     parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
+    parser.add_argument("--use-flash-attention", action="store_true", help="Use Flash Attention 2 for LLMChat backend.")
     args = parser.parse_args()
 
     if len(args.agent_names) != len(args.agent_nums):
@@ -117,6 +118,9 @@ async def main():
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(args.mode, len(agent_names))
 
+    logger.info("[CONFIG] Model: {}, Mode: {}, Execution: {}, Flash Attention: {}",
+                args.llm_name, args.mode, args.execution_mode, args.use_flash_attention)
+
     kv_config: Optional[KVCommConfig] = None
     if args.execution_mode == "allow_kv_reuse":
         kv_config = KVCommConfig.from_env().apply_overrides(
@@ -135,6 +139,7 @@ async def main():
         agent_names=agent_names,
         decision_method=args.decision_method,
         kv_config=kv_config,
+        use_flash_attention=args.use_flash_attention,
         **kwargs,
     )
 

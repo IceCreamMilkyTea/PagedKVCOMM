@@ -232,11 +232,12 @@ class LLMChat(LLM):
     """
     _shared_model = None
     _shared_tokenizer = None
-    _model_lock = threading.Lock()                                        
+    _model_lock = threading.Lock()
     _THREAD_POOL: ThreadPoolExecutor | None = None
     _THREAD_POOL_WORKERS: int | None = None
     _shared_kv_cache_memory = None
     _initialization = {}
+    _use_flash_attention = False  # Class variable for Flash Attention setting
     anchors = KVCOMMEngine.anchors
     anchor_dict = KVCOMMEngine.anchor_dict
     anchor_len_dict = KVCOMMEngine.anchor_len_dict
@@ -249,21 +250,23 @@ class LLMChat(LLM):
     _active_requests = KVCOMMEngine._active_requests
     _staged_commits = KVCOMMEngine._staged_commits
 
-    def __init__(self, model_name: str, prefix: str = None, config: KVCommConfig | None = None):
+    def __init__(self, model_name: str, prefix: str = None, config: KVCommConfig | None = None, use_flash_attention: bool = False):
         """Create a chat model instance and initialize shared resources.
 
         Args:
             model_name: HF model identifier.
             prefix: Optional legacy/template prefix configuration.
             config: KVComm runtime configuration.
+            use_flash_attention: Whether to use Flash Attention 2. Default is False.
         """
         self.model_name = model_name
+        LLMChat._use_flash_attention = use_flash_attention
 
         self.config = (config or KVCommConfig.from_env()).validate()
         self._ensure_thread_pool(self.config.thread_pool_workers)
         self.kv_engine = KVCOMMEngine(self)
 
-        self.lock = asyncio.Lock()                       
+        self.lock = asyncio.Lock()
 
 
         self._initialize_shared_resources()
@@ -1051,14 +1054,27 @@ class LLMChat(LLM):
         with LLMChat._model_lock:
             if LLMChat._shared_model is None:
                 LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                if LLMChat._use_flash_attention:
+                    # Flash Attention 2 requires float16 or bfloat16
+                    model_dtype = torch.bfloat16
+                elif 'llama' in self.model_name:
+                    model_dtype = torch.float16
+                else:
+                    model_dtype = torch.float32
+                model_kwargs = {
+                    "torch_dtype": model_dtype,
+                    "low_cpu_mem_usage": True,
+                    "device_map": "cuda:0",
+                    "trust_remote_code": True
+                }
+                if LLMChat._use_flash_attention:
+                    model_kwargs["attn_implementation"] = "flash_attention_2"
                 LLMChat._shared_model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
-                    torch_dtype=torch.float16 if 'llama' in self.model_name else torch.float32,
-                    low_cpu_mem_usage=True,
-                    device_map="cuda:0",
-                    trust_remote_code=True
+                    **model_kwargs
                 )
-                logger.info("Model {} loaded and shared across instances.", self.model_name)
+                attn_mode = "Flash Attention 2" if LLMChat._use_flash_attention else "default"
+                logger.info("Model {} loaded (attention mode: {}) and shared across instances.", self.model_name, attn_mode)
             if LLMChat._shared_kv_cache_memory is None:
                 LLMChat._shared_kv_cache_memory = {}
 
@@ -1568,8 +1584,9 @@ class LLMChat(LLM):
             anchor_activated_list=anchor_active_list,
         ) # prob = True/False
         safe_message = _escape_loguru_markup(message)
-        logger.opt(colors=True).debug(
-            f"<magenta>Agent {self.node_id} Role {self.role} Message {safe_message} Response Anchor Prediction: {prob}</magenta>",
+        reuse_label = "REUSABLE" if not prob else "NEW_ANCHOR"
+        logger.opt(colors=True).info(
+            f"<magenta>[RESPONSE_ANCHOR] Agent {self.node_id} Role {self.role} | {reuse_label} | anchors={len(response_anchor_list)} | Message {safe_message}</magenta>",
         )
         state.anchor_dict.setdefault(current_key, {})[message] = prob # Store the anchor prediction result for set_anchor 
 
@@ -1858,7 +1875,7 @@ class LLMChat(LLM):
                 "input_ids": response_tokens,
                 "attention_mask": response_mask,
             }
-        )
+        ) # token ids will be stored in shared memory in both modes and used for anchor update in dense_prefill mode
         resp_drop.setdefault(message, []).append(0)
 
         accumulate_len = 0
@@ -1880,11 +1897,12 @@ class LLMChat(LLM):
         )
         state.anchor_dict.setdefault(current_key, {})[message] = prob
 
+        # Update the active count in anchor_info_bucket with the new count from prediction
         if not prob:
             global_bucket = state.global_anchor_info.setdefault(current_key, {})
             info_items = list(anchor_info_bucket.items())
             for idx, (msg_key, _) in enumerate(info_items):
-                anchor_info_bucket[msg_key] = anchor_active_list[idx] # Update the active count in anchor_info_bucket with the new count from prediction
+                anchor_info_bucket[msg_key] = anchor_active_list[idx] 
                 bucket_entry = global_bucket.setdefault(msg_key, [0, 0])
                 bucket_entry[0] = anchor_active_list[idx]
 

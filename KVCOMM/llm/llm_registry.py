@@ -46,15 +46,19 @@ class LLMRegistry:
         if paged is None:
             paged = os.environ.get("KVCOMM_PAGED", "0") == "1"
 
+        # PagedLLMChat doesn't use flash attention (nano-vllm handles its own attention);
+        # strip the kwarg so it doesn't cause a TypeError.
+        paged_kwargs = {k: v for k, v in kwargs.items() if k != "use_flash_attention"}
+
         if model_name == 'mock':
             model = cls.registry.get(model_name, **kwargs)
         elif paged and ('llama' in model_name.lower() or 'qwen' in model_name.lower()):
-            model = cls.registry.get('PagedLLMChat', model_name, prefix=prefix, config=llm_config, **kwargs)
-        elif 'llama' in model_name.lower():                                                    
+            model = cls.registry.get('PagedLLMChat', model_name, prefix=prefix, config=llm_config, **paged_kwargs)
+        elif 'llama' in model_name.lower():
             model = cls.registry.get('LLMChat', model_name, prefix=prefix, config=llm_config, **kwargs)
-        elif 'qwen' in model_name.lower():                                             
+        elif 'qwen' in model_name.lower():
             model = cls.registry.get('LLMChat', model_name, prefix=prefix, config=llm_config, **kwargs)
-        else:                                      
+        else:
             model = cls.registry.get('GPTChat', model_name, **kwargs)
 
         return model

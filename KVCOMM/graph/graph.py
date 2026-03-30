@@ -51,6 +51,7 @@ class Graph(ABC):
                 fixed_temporal_masks:List[List[int]] = None,
                 node_kwargs:List[Dict] = None,
                 kv_config: KVCommConfig | None = None,
+                use_flash_attention: bool = False,
                 ):
 
         num_agents = len(agent_names)
@@ -69,7 +70,7 @@ class Graph(ABC):
         self.agent_names:List[str] = agent_names
         self.decision_node:Node = AgentRegistry.get(
             decision_method,
-            **{"domain": self.domain, "llm_name": self.llm_name, "llm_config": self.kv_config},
+            **{"domain": self.domain, "llm_name": self.llm_name, "llm_config": self.kv_config, "use_flash_attention": use_flash_attention},
         ) if decision_method is not None else None
         self.nodes:Dict[str,Node] = {}
         self.potential_spatial_edges:List[List[str, str]] = []
@@ -77,6 +78,7 @@ class Graph(ABC):
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
         for kwargs in self.node_kwargs:
             kwargs.setdefault("llm_config", self.kv_config)
+            kwargs.setdefault("use_flash_attention", use_flash_attention)
 
         self.init_nodes()                              
         self.init_potential_edges()                                                                   

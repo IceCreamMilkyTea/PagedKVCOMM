@@ -3,7 +3,16 @@ import torch
 import asyncio
 
 from KVCOMM.llm import LLMChat
+from KVCOMM.llm.paged_llm_chat import PagedLLMChat
 from KVCOMM.utils.log import logger
+from nanovllm.sampling_params import SamplingParams
+
+
+def _escape_loguru_markup(text: str) -> str:
+    """Escape Loguru markup tokens in free-form text."""
+    if text is None:
+        return ""
+    return text.replace("<", "\\<")
 
 
 def gsm_data_process(dataset):
@@ -89,12 +98,51 @@ async def get_pred_value(pred_str):
         answer = str(answer)
     answer = answer.split("A: ", 1)[-1]
 
+    # Try to get model and tokenizer from LLMChat (non-paged backend)
     tokenizer = LLMChat._shared_tokenizer
     model = LLMChat._shared_model
+
+    # If not available, try PagedLLMChat (paged backend)
     if tokenizer is None or model is None:
-        # Paged backend has no HF model; fall back to regex-based extraction.
+        tokenizer = PagedLLMChat._shared_tokenizer
+        engine = PagedLLMChat._shared_engine
+        if tokenizer is not None and engine is not None:
+            # Use nanovllm engine.generate() for paged backend
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are professional in extracting the exact value from the user response. "
+                        "Given the following user response, you should only output the value that is argued "
+                        "as the most correct answer by the user for evaluation, i.e., only an integer or "
+                        "float-type value in one line."
+                    ),
+                },
+                {"role": "user", "content": answer},
+            ]
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            sp = SamplingParams(max_tokens=128, temperature=0.0)
+            outputs = await asyncio.to_thread(engine.generate, [prompt], sp, use_tqdm=False)
+            response_message = outputs[0]["text"].strip() if outputs else "0"
+            # Filter out special tokens like <|eot_id|>, <|start_header_id|>, etc.
+            response_message = re.sub(r'<\|[^|]+\|>', '', response_message).strip()
+            safe_message = _escape_loguru_markup(response_message)
+            logger.opt(colors=True).debug(f"<blue>[GSM8K:paged]</blue> {safe_message}")
+            # Extract numerical value from response
+            return gsm_get_predict(response_message)
+        else:
+            # No engine available; fall back to regex-based extraction.
+            return gsm_get_predict(answer)
+
+    if tokenizer is None or model is None:
+        # No model available; fall back to regex-based extraction.
         return gsm_get_predict(answer)
 
+    # Use HuggingFace model.generate() for LLMChat backend
     messages = [
         {
             "role": "system",
@@ -113,9 +161,15 @@ async def get_pred_value(pred_str):
         add_generation_prompt=True,
         return_tensors="pt",
     )
+    # Get device
+    try:
+        device = model.device
+    except AttributeError:
+        device = next(model.parameters()).device
+
     inputs = {
-        "input_ids": token_inputs.to(model.device),
-        "attention_mask": torch.ones_like(token_inputs).to(model.device),
+        "input_ids": token_inputs.to(device),
+        "attention_mask": torch.ones_like(token_inputs).to(device),
     }
 
     prompt_length = inputs["input_ids"].shape[-1]
@@ -128,8 +182,10 @@ async def get_pred_value(pred_str):
     outputs = await asyncio.to_thread(model.generate, **inputs, **generate_kwargs)
     generated = outputs.sequences[:, prompt_length:]
     response_message = tokenizer.decode(generated[0], skip_special_tokens=True).strip()
-    logger.opt(colors=True).debug(f"<blue>[GSM8K]</blue> {response_message}")
-    return response_message
+    safe_message = _escape_loguru_markup(response_message)
+    logger.opt(colors=True).debug(f"<blue>[GSM8K:hf]</blue> {safe_message}")
+    # Extract numerical value from response
+    return gsm_get_predict(response_message)
 
 
 def _fix_sqrt(string):
