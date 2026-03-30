@@ -2,10 +2,10 @@
 #SBATCH --job-name=ttft-bench
 #SBATCH --partition=compsci-gpu
 #SBATCH --gres=gpu:1
-#SBATCH --constraint=a6000
-#SBATCH --cpus-per-task=8
+#SBATCH --constraint=a5000
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=48G
-#SBATCH --time=06:00:00
+#SBATCH --time=36:00:00
 #SBATCH --output=logs/ttft_%j.out
 #SBATCH --error=logs/ttft_%j.err
 
@@ -43,7 +43,7 @@ source "$VENV_DIR/bin/activate"
 export PYTHONPATH="$PROJECT_ROOT:${PYTHONPATH:-}"
 nvidia-smi || true
 
-METHODS=("dense" "kvcomm" "paged_kvcomm")
+METHODS=("kvcomm")
 FAILED=0
 
 for METHOD in "${METHODS[@]}"; do
@@ -52,7 +52,7 @@ for METHOD in "${METHODS[@]}"; do
     python experiments/benchmark_TTFT.py \
         --llm_name "${MODEL}" \
         --method "${METHOD}" \
-        --agent_nums 5 \
+        --agent_nums 4 \
         --samples 100 \
         --output_dir "${RESULTS_DIR}/TTFT/${METHOD}" \
         ${USE_LOCAL_REF} \

@@ -695,7 +695,6 @@ class LLMChat(LLM):
             use_cache=True,
             max_length=token_ids["input_ids"].shape[-1] + 1,
             return_dict_in_generate=True,
-            return_legacy_cache=False,
         )
         condition_cache = generated.past_key_values
 
@@ -827,7 +826,6 @@ class LLMChat(LLM):
                     use_cache=True,
                     max_length=token_ids["input_ids"].shape[-1] + 1,
                     return_dict_in_generate=True,
-                    return_legacy_cache=False,
                 )
             torch.cuda.synchronize()
             end_time = perf_counter()
@@ -840,7 +838,6 @@ class LLMChat(LLM):
                 use_cache=True,
                 max_length=token_ids["input_ids"].shape[-1] + 1,
                 return_dict_in_generate=True,
-                return_legacy_cache=False,
             )
         input_cache = output.past_key_values
 
@@ -1029,7 +1026,6 @@ class LLMChat(LLM):
                 use_cache=True,
                 max_length=token_ids['input_ids'].shape[-1] + 1,
                 return_dict_in_generate=True,
-                return_legacy_cache=False,
             )
         base_kv = out.past_key_values.slice_(start=0, end=token_ids['input_ids'].shape[-1])                                               
         segment_kv_list = []
@@ -1166,7 +1162,6 @@ class LLMChat(LLM):
                 "temperature": temperature,
                 "max_new_tokens": max_tokens,
                 "return_dict_in_generate": True,
-                "return_legacy_cache": False,
                 "use_cache": True,
             }
             ttft_tracer = _TTFTTracer(prompt_length)
@@ -1464,7 +1459,6 @@ class LLMChat(LLM):
             "max_length": max_tokens + prefix_token_length,
             "do_sample": False,
             "temperature": temperature,
-            "return_legacy_cache": False,
             "return_dict_in_generate": True,
         }
 
@@ -1779,7 +1773,6 @@ class LLMChat(LLM):
             "min_new_tokens": min_tokens,
             "do_sample": False,
             "temperature": temperature,
-            "return_legacy_cache": False,
             "return_dict_in_generate": True,
         }
 

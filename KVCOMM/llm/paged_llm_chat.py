@@ -975,6 +975,14 @@ class PagedLLMChat(LLM):
                 }
                 placeholder_source = "stored_template_filtered"
 
+                # Fallback: use runtime-aligned user_question span from reuse info
+                # when stored template spans don't fit the current prompt length.
+                if not placeholder_info_for_anchor:
+                    uq_span = placeholder_info_for_reuse.get("user_question")
+                    if uq_span and uq_span[0] >= 0 and uq_span[1] > uq_span[0] and uq_span[1] <= len(token_ids):
+                        placeholder_info_for_anchor["user_question"] = list(uq_span)
+                        placeholder_source = "runtime_anchor_fallback"
+
             logger.info(
                 "[PLACEHOLDER_SPAN:paged] node={} role={} request_uid={} source={} dynamic_count={} stored_count={} anchor_count={} prompt_tokens={}",
                 getattr(self, "node_id", "?"),
@@ -1059,10 +1067,15 @@ class PagedLLMChat(LLM):
                     # Block range for prefix after placeholder
                     pf_start = ph_end
                     pf_end = prompt_num_tokens
-                    pf_start_block = pf_start // bs
-                    pf_end_block = (pf_end - 1) // bs + 1
-                    pf_blocks = block_table[pf_start_block:pf_end_block]
                     pf_num = pf_end - pf_start
+                    if pf_num > 0:
+                        pf_start_block = pf_start // bs
+                        pf_end_block = (pf_end - 1) // bs + 1
+                        pf_blocks = block_table[pf_start_block:pf_end_block]
+                    else:
+                        pf_start_block = 0
+                        pf_end_block = 0
+                        pf_blocks = []
 
                     # Validate that block ranges are within the actual block table.
                     # placeholder_info positions are from the template prompt; if the
@@ -1087,37 +1100,16 @@ class PagedLLMChat(LLM):
                         )
                         continue
 
-                    if pf_num <= 0 or not pf_blocks:
-                        _record_anchor_skip("prefix_blocks_out_of_range")
-                        logger.info(
-                            "dense_prefill: skipping set_anchor for {} — prefix blocks out of range "
-                            "(pf_start_block={}, pf_end_block={}, block_table_len={}, pf_num={})",
-                            ph_id,
-                            pf_start_block,
-                            pf_end_block,
-                            len(block_table),
-                            pf_num,
-                        )
-                        continue
-
                     # We need base blocks - stored in prefix_block_info
                     base_block_table = prefix_store.get("prefix_block_table", [])
                     if base_block_table:
                         base_ph_blocks = base_block_table[ph_start_block:ph_end_block]
-                        base_pf_blocks = base_block_table[pf_start_block:pf_end_block]
+                        base_pf_blocks = base_block_table[pf_start_block:pf_end_block] if pf_num > 0 else []
 
                         if not base_ph_blocks:
                             _record_anchor_skip("base_blocks_out_of_range")
                             logger.info(
                                 "dense_prefill: skipping set_anchor for {} — base blocks out of range",
-                                ph_id,
-                            )
-                            continue
-
-                        if not base_pf_blocks:
-                            _record_anchor_skip("base_prefix_blocks_out_of_range")
-                            logger.info(
-                                "dense_prefill: skipping set_anchor for {} — base prefix blocks out of range",
                                 ph_id,
                             )
                             continue

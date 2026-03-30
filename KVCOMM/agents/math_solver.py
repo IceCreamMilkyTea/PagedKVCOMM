@@ -21,7 +21,7 @@ class MathSolver(Node):
     ):
         super().__init__(id, "MathSolver" ,domain, llm_name)
         prefix = "A: "
-        self.llm = LLMRegistry.get(llm_name, prefix=prefix)
+        self.llm = LLMRegistry.get(llm_name, prefix=prefix, llm_config=llm_config)
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role = self.prompt_set.get_role() if role is None else role
         self.llm.set_id(self.id, self.role)

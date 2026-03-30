@@ -344,6 +344,13 @@ class PagedKVCOMMEngine:
 
         # Compute prefix delta: real - base
         if real_prefix_num_tokens <= 0 or base_prefix_num_tokens <= 0:
+            with self._lock:
+                entry.agent_deltas[agent_id] = {
+                    "ph_delta_blocks": ph_delta_blocks,
+                    "ph_delta_num_tokens": real_num_tokens,
+                    "pf_delta_blocks": [],
+                    "pf_delta_num_tokens": 0,
+                }
             return
         real_pf_key, real_pf_val = self.read_kv_from_blocks(
             real_prefix_block_table, real_prefix_num_tokens
