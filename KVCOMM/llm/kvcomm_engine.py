@@ -823,41 +823,46 @@ class KVCOMMEngine:
         placeholder_len: int,
         temperature: float,
     ) -> Optional[Dict[str, torch.Tensor]]:
-        """Compute attention-like weights between the real placeholder segment and stored anchors."""
+        """Compute attention-like weights between the real placeholder segment and stored anchors.
+
+        Iterates over anchors instead of stacking all embeddings into one large
+        tensor, avoiding OOM when the number of eligible anchors is high.
+        """
         if not anchor_indices:
             return None
         used_anchors = [anchor_list[idx] for idx in anchor_indices]
 
-        anchor_key_placeholder = torch.stack(
-            [anchor["ph_key_embedding"][..., -placeholder_len:, :] for anchor in used_anchors]
-        )
-        anchor_value_placeholder = torch.stack(
-            [anchor["ph_value_embedding"][..., -placeholder_len:, :] for anchor in used_anchors]
-        )
         real_key_placeholder = real_key_embedding[..., -placeholder_len:, :]
         real_value_placeholder = real_value_embedding[..., -placeholder_len:, :]
 
-        sims_key_prefix = (real_key_placeholder.unsqueeze(0) - anchor_key_placeholder).norm(2, dim=-2)
+        # --- prefix weights (norm along token dim) ---
+        sims_key_prefix_list = []
+        sims_val_prefix_list = []
+        for anchor in used_anchors:
+            ak = anchor["ph_key_embedding"][..., -placeholder_len:, :]
+            av = anchor["ph_value_embedding"][..., -placeholder_len:, :]
+            sims_key_prefix_list.append((real_key_placeholder - ak).norm(2, dim=-2))
+            sims_val_prefix_list.append((real_value_placeholder - av).norm(2, dim=-2))
+
+        sims_key_prefix = torch.stack(sims_key_prefix_list, dim=0)
         weights_key_prefix = torch.softmax(-sims_key_prefix.float() / temperature, dim=0).unsqueeze(-2)
 
-        sims_val_prefix = (real_value_placeholder.unsqueeze(0) - anchor_value_placeholder).norm(2, dim=-2)
+        sims_val_prefix = torch.stack(sims_val_prefix_list, dim=0)
         weights_value_prefix = torch.softmax(-sims_val_prefix.float() / temperature, dim=0).unsqueeze(-2)
 
-        anchor_key_placeholder = torch.stack(
-            [anchor["ph_key_embedding"][..., :placeholder_len, :] for anchor in used_anchors]
-        )
-        anchor_value_placeholder = torch.stack(
-            [anchor["ph_value_embedding"][..., :placeholder_len, :] for anchor in used_anchors]
-        )
+        # --- placeholder weights (abs-mean over most dims) ---
+        sims_key_ph_list = []
+        sims_val_ph_list = []
+        for anchor in used_anchors:
+            ak = anchor["ph_key_embedding"][..., :placeholder_len, :]
+            av = anchor["ph_value_embedding"][..., :placeholder_len, :]
+            sims_key_ph_list.append((real_key_placeholder - ak).abs().mean(dim=(-5, -4, -3, -1), keepdim=True))
+            sims_val_ph_list.append((real_value_placeholder - av).abs().mean(dim=(-5, -4, -3, -1), keepdim=True))
 
-        sims_key_placeholder = (
-            real_key_placeholder.unsqueeze(0) - anchor_key_placeholder
-        ).abs().mean(dim=(-5, -4, -3, -1), keepdim=True)
+        sims_key_placeholder = torch.stack(sims_key_ph_list, dim=0)
         weights_key_placeholder = torch.softmax(-sims_key_placeholder.float() / temperature, dim=0)
 
-        sims_val_placeholder = (
-            real_value_placeholder.unsqueeze(0) - anchor_value_placeholder
-        ).abs().mean(dim=(-5, -4, -3, -1), keepdim=True)
+        sims_val_placeholder = torch.stack(sims_val_ph_list, dim=0)
         weights_value_placeholder = torch.softmax(-sims_val_placeholder.float() / temperature, dim=0)
 
         return {
@@ -986,6 +991,199 @@ class KVCOMMEngine:
         updated_prefix_value[0] = base_prefix_value[0]
         _assign_stack_to_cache(new_prefix_cache, updated_prefix_key, updated_prefix_value)
         _set_seen_tokens(new_prefix_cache, _safe_seq_len(base_prefix_cache))
+
+        return new_placeholder_cache, new_prefix_cache
+
+    # ── Local-reference offset (inner-round optimisation) ─────────────
+
+    def offset_kv_cache_pair_local_ref(
+        self,
+        ph_id: str,
+        message: str,
+        request_uid: str,
+        base_placeholder_cache: DynamicCache,
+        base_prefix_cache: DynamicCache,
+        anchor_list: List[Dict],
+        upstream_agent_id: str,
+        temperature: int = 1,
+    ) -> Tuple[DynamicCache, DynamicCache]:
+        """Approximate target KV using an upstream agent's KV as local reference.
+
+        Instead of the base-reference formula:
+            approx = base + Σ(w_k × delta_base→target_k)
+
+        This uses a closer reference point:
+            approx = upstream_KV + Σ(w_k × cross_delta_k)
+
+        where cross_delta_k = delta_base→target_k − delta_base→upstream_k
+        and   upstream_KV    = base + delta_base→upstream(current_message)  [exact]
+
+        Falls back to base-reference when the upstream agent's delta is not
+        available for the current message or no anchor has both agents' deltas.
+        """
+        node_id = self.llm.node_id
+        up_ph_key = f"{upstream_agent_id}_ph_key_delta"
+        up_ph_val = f"{upstream_agent_id}_ph_value_delta"
+        up_pf_key = f"{upstream_agent_id}_pf_key_delta"
+        up_pf_val = f"{upstream_agent_id}_pf_value_delta"
+        tgt_ph_key = f"{node_id}_ph_key_delta"
+        tgt_pf_key = f"{node_id}_pf_key_delta"
+
+        # --- 1. Find upstream delta for CURRENT message ---------------
+        state = self.resolve_request_state(request_uid)
+        current_entry = state.anchors.get(ph_id, {}).get(message)
+        if current_entry is None or up_ph_key not in current_entry:
+            self._log_warning(
+                f"[LOCAL_REF] No upstream delta for agent {upstream_agent_id} "
+                f"on message '{message[:40]}', falling back to base-reference."
+            )
+            return self.offset_kv_cache_pair(
+                ph_id, message, request_uid,
+                base_placeholder_cache, base_prefix_cache,
+                anchor_list, temperature,
+            )
+
+        # --- 2. Filter anchors that have BOTH target & upstream deltas -
+        eligible_indices = [
+            i for i, a in enumerate(anchor_list)
+            if tgt_ph_key in a and up_ph_key in a
+        ]
+        if not eligible_indices:
+            self._log_warning(
+                "[LOCAL_REF] No anchor has both target & upstream deltas, "
+                "falling back to base-reference."
+            )
+            return self.offset_kv_cache_pair(
+                ph_id, message, request_uid,
+                base_placeholder_cache, base_prefix_cache,
+                anchor_list, temperature,
+            )
+
+        placeholder_len = _safe_seq_len(base_placeholder_cache)
+        if placeholder_len <= 0:
+            return base_placeholder_cache, base_prefix_cache
+
+        # Further filter by coverage
+        eligible_indices = [
+            i for i in eligible_indices
+            if anchor_list[i]["ph_key_embedding"].shape[-2] >= placeholder_len
+        ]
+        if not eligible_indices:
+            return self.offset_kv_cache_pair(
+                ph_id, message, request_uid,
+                base_placeholder_cache, base_prefix_cache,
+                anchor_list, temperature,
+            )
+
+        # --- 3. Compute weights (same similarity as base-ref path) ----
+        real_key_embedding, real_value_embedding = self._stack_cache_tensors(
+            base_placeholder_cache
+        )
+
+        cache_key = ("local_ref", upstream_agent_id)
+        weight_entry = self._compute_anchor_weight_entry(
+            anchor_list,
+            eligible_indices,
+            real_key_embedding,
+            real_value_embedding,
+            placeholder_len,
+            float(temperature),
+        )
+        if weight_entry is None:
+            return self.offset_kv_cache_pair(
+                ph_id, message, request_uid,
+                base_placeholder_cache, base_prefix_cache,
+                anchor_list, temperature,
+            )
+
+        anchor_index = weight_entry["anchor_index"]
+        w_k_pf = weight_entry["weights_key_for_prefix"]
+        w_v_pf = weight_entry["weights_value_for_prefix"]
+        w_k_ph = weight_entry["weights_key_for_placeholder"]
+        w_v_ph = weight_entry["weights_value_for_placeholder"]
+
+        # --- 4. Reconstruct exact upstream KV for current input -------
+        upstream_ph_key_d = current_entry[up_ph_key]
+        upstream_ph_val_d = current_entry[up_ph_val]
+
+        upstream_ph_key = real_key_embedding + upstream_ph_key_d[..., :placeholder_len, :].to(
+            real_key_embedding.dtype
+        )
+        upstream_ph_val = real_value_embedding + upstream_ph_val_d[..., :placeholder_len, :].to(
+            real_value_embedding.dtype
+        )
+
+        # --- 5. Compute weighted cross-deltas (placeholder) ----------
+        cross_ph_key_stack = torch.stack([
+            (anchor_list[i][tgt_ph_key][..., :placeholder_len, :]
+             - anchor_list[i][up_ph_key][..., :placeholder_len, :])
+            for i in anchor_index
+        ])
+        cross_ph_val_stack = torch.stack([
+            (anchor_list[i][f"{node_id}_ph_value_delta"][..., :placeholder_len, :]
+             - anchor_list[i][up_ph_val][..., :placeholder_len, :])
+            for i in anchor_index
+        ])
+
+        ph_cross_delta_key = (w_k_ph * cross_ph_key_stack).sum(0)
+        ph_cross_delta_val = (w_v_ph * cross_ph_val_stack).sum(0)
+
+        # --- 6. Apply: result = upstream_KV + cross_delta -------------
+        new_placeholder_cache = base_placeholder_cache.copy()
+        updated_ph_key = upstream_ph_key + ph_cross_delta_key.to(upstream_ph_key.dtype)
+        updated_ph_key[0] = real_key_embedding[0]  # layer 0 unchanged
+        updated_ph_val = upstream_ph_val + ph_cross_delta_val.to(upstream_ph_val.dtype)
+        updated_ph_val[0] = real_value_embedding[0]
+        _assign_stack_to_cache(new_placeholder_cache, updated_ph_key, updated_ph_val)
+        _set_seen_tokens(new_placeholder_cache, _safe_seq_len(base_placeholder_cache))
+
+        # --- 7. Prefix cross-delta ------------------------------------
+        base_pf_key, base_pf_val = self._stack_cache_tensors(base_prefix_cache)
+
+        has_pf = all(
+            up_pf_key in anchor_list[i] and tgt_pf_key in anchor_list[i]
+            for i in anchor_index
+        )
+        if has_pf and up_pf_key in current_entry:
+            upstream_pf_key = base_pf_key + current_entry[up_pf_key].to(base_pf_key.dtype)
+            upstream_pf_val = base_pf_val + current_entry[up_pf_val].to(base_pf_val.dtype)
+
+            cross_pf_key_stack = torch.stack([
+                anchor_list[i][tgt_pf_key] - anchor_list[i][up_pf_key]
+                for i in anchor_index
+            ])
+            cross_pf_val_stack = torch.stack([
+                anchor_list[i][f"{node_id}_pf_value_delta"] - anchor_list[i][up_pf_val]
+                for i in anchor_index
+            ])
+            pf_cross_key = (w_k_pf * cross_pf_key_stack).sum(0)
+            pf_cross_val = (w_v_pf * cross_pf_val_stack).sum(0)
+
+            updated_pf_key = upstream_pf_key + pf_cross_key.to(upstream_pf_key.dtype)
+            updated_pf_val = upstream_pf_val + pf_cross_val.to(upstream_pf_val.dtype)
+        else:
+            # Prefix fallback: use base-reference for prefix portion
+            pf_key_stack = torch.stack([
+                anchor_list[i][tgt_pf_key] for i in anchor_index
+            ])
+            pf_val_stack = torch.stack([
+                anchor_list[i][f"{node_id}_pf_value_delta"] for i in anchor_index
+            ])
+            updated_pf_key = base_pf_key + (w_k_pf * pf_key_stack).sum(0).to(base_pf_key.dtype)
+            updated_pf_val = base_pf_val + (w_v_pf * pf_val_stack).sum(0).to(base_pf_val.dtype)
+
+        updated_pf_key[0] = base_pf_key[0]
+        updated_pf_val[0] = base_pf_val[0]
+
+        new_prefix_cache = base_prefix_cache.copy()
+        _assign_stack_to_cache(new_prefix_cache, updated_pf_key, updated_pf_val)
+        _set_seen_tokens(new_prefix_cache, _safe_seq_len(base_prefix_cache))
+
+        logger.opt(colors=True).info(
+            f"<green>[LOCAL_REF:hf] APPLIED | Agent {node_id} ph_id={ph_id} | "
+            f"upstream={upstream_agent_id} | anchors_used={len(anchor_index)} | "
+            f"ph_tokens={placeholder_len}</green>"
+        )
 
         return new_placeholder_cache, new_prefix_cache
 
@@ -1301,14 +1499,52 @@ class KVCOMMEngine:
     ) -> Tuple[int, DynamicCache, Dict[str, torch.Tensor]]:
         """Rotate and offset a single placeholder/prefix segment for kv_reuse mode."""
         new_ph, new_pf = self._rotate_segment_caches(m)
-        new_ph, new_pf = self.offset_kv_cache_pair(
-            m["ph_id"], message, request_uid, new_ph, new_pf, anchors_for_ph, temperature=1
-        )
+
+        # Route: local-reference or base-reference
+        use_local = getattr(self.llm, "config", None) and self.llm.config.use_local_reference
+        if use_local:
+            upstream_id = self._find_upstream_agent(request_uid, m["ph_id"], message)
+            if upstream_id is not None:
+                new_ph, new_pf = self.offset_kv_cache_pair_local_ref(
+                    m["ph_id"], message, request_uid,
+                    new_ph, new_pf, anchors_for_ph,
+                    upstream_agent_id=upstream_id, temperature=1,
+                )
+            else:
+                new_ph, new_pf = self.offset_kv_cache_pair(
+                    m["ph_id"], message, request_uid,
+                    new_ph, new_pf, anchors_for_ph, temperature=1,
+                )
+        else:
+            new_ph, new_pf = self.offset_kv_cache_pair(
+                m["ph_id"], message, request_uid,
+                new_ph, new_pf, anchors_for_ph, temperature=1,
+            )
 
         seg_cache = new_ph.concat_([new_pf])
         seg_token_ids = concat(self.trim_token_ids(m["ph_cache_ids"], m["drop_num"]), m["pf_ids"])
 
         return m["idx"], seg_cache, seg_token_ids
+
+    def _find_upstream_agent(
+        self, request_uid: str, ph_id: str, message: str,
+    ) -> Optional[str]:
+        """Find an agent that already stored a delta for this message (upstream reference).
+
+        Returns the first agent_id found that is not the current agent, or None.
+        """
+        state = self.resolve_request_state(request_uid)
+        entry = state.anchors.get(ph_id, {}).get(message)
+        if entry is None:
+            return None
+        node_id = self.llm.node_id
+        suffix = "_ph_key_delta"
+        for key in entry:
+            if key.endswith(suffix):
+                agent = key[: -len(suffix)]
+                if agent != node_id:
+                    return agent
+        return None
 
     def process_anchor(
         self,

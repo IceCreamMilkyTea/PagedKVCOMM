@@ -442,6 +442,19 @@ class PagedLLMChat(LLM):
 
         return seq.completion_token_ids, ttft, prefill_latency, seq
 
+    def _find_upstream_agent_paged(self, ph_id: str, message: str) -> Optional[str]:
+        """Find an agent that already stored a delta for this message (upstream ref).
+
+        Returns the first agent_id that is not self.node_id, or None.
+        """
+        entry = self.paged_kv_engine.anchors.get(ph_id, {}).get(message)
+        if entry is None:
+            return None
+        for agent_id in entry.agent_deltas:
+            if agent_id != self.node_id:
+                return agent_id
+        return None
+
     def _prepare_kv_reuse_prefix_blocks(
         self,
         *,
@@ -518,17 +531,38 @@ class PagedLLMChat(LLM):
             return None, 0, stats
 
         stats["offset_calls"] += 1
-        new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache(
-            agent_id=self.node_id,
-            ph_id=ph_id,
-            message=message_key,
-            base_ph_block_table=base_ph_blocks,
-            base_ph_num_tokens=ph_num,
-            base_pf_block_table=base_pf_blocks,
-            base_pf_num_tokens=pf_num,
-            anchor_list=anchor_messages,
-            temperature=1.0,
-        )
+
+        # Route: local-reference or base-reference
+        use_local = getattr(self, "config", None) and self.config.use_local_reference
+        upstream_id = None
+        if use_local:
+            upstream_id = self._find_upstream_agent_paged(ph_id, message_key)
+
+        if use_local and upstream_id is not None:
+            new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache_local_ref(
+                agent_id=self.node_id,
+                ph_id=ph_id,
+                message=message_key,
+                base_ph_block_table=base_ph_blocks,
+                base_ph_num_tokens=ph_num,
+                base_pf_block_table=base_pf_blocks,
+                base_pf_num_tokens=pf_num,
+                anchor_list=anchor_messages,
+                upstream_agent_id=upstream_id,
+                temperature=1.0,
+            )
+        else:
+            new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache(
+                agent_id=self.node_id,
+                ph_id=ph_id,
+                message=message_key,
+                base_ph_block_table=base_ph_blocks,
+                base_ph_num_tokens=ph_num,
+                base_pf_block_table=base_pf_blocks,
+                base_pf_num_tokens=pf_num,
+                anchor_list=anchor_messages,
+                temperature=1.0,
+            )
 
         if new_ph_blocks != base_ph_blocks or new_pf_blocks != base_pf_blocks:
             stats["offset_effective"] += 1
@@ -1122,6 +1156,8 @@ class PagedLLMChat(LLM):
                             real_prefix_num_tokens=pf_num,
                             base_prefix_block_table=base_pf_blocks,
                             base_prefix_num_tokens=pf_num,
+                            max_anchor_num=self.config.max_anchor_num,
+                            window_length=self.config.window_size,
                         )
                         reuse_stats["anchor_set_count"] += 1
                     else:
@@ -1178,12 +1214,14 @@ class PagedLLMChat(LLM):
 
             if not resp_prob:
                 # Reusable — update activation counts
+                engine_info = self.paged_kv_engine.anchor_info.setdefault(response_anchor_key, {})
                 for idx, anchor_msg_key in enumerate(resp_anchor_messages):
                     if idx >= len(resp_activated):
                         break
                     resp_info_bucket[anchor_msg_key] = resp_activated[idx]
                     bucket_entry = resp_global_bucket.setdefault(anchor_msg_key, [0, 0])
                     bucket_entry[0] = resp_activated[idx]
+                    engine_info[anchor_msg_key] = resp_activated[idx]
             else:
                 # New anchor — only record the flag; do NOT register_base_anchor here.
                 # Registering without agent deltas causes has_active_anchor to force
@@ -1360,12 +1398,14 @@ class PagedLLMChat(LLM):
         message_key = self._message_cache_key(message)
 
         if not prob:
+            engine_info = self.paged_kv_engine.anchor_info.setdefault(anchor_namespace, {})
             for idx, anchor_msg_key in enumerate(anchor_messages):
                 if idx >= len(anchor_activated_list):
                     break
                 uq_info_bucket[anchor_msg_key] = anchor_activated_list[idx]
                 bucket_entry = global_bucket.setdefault(anchor_msg_key, [0, 0])
                 bucket_entry[0] = anchor_activated_list[idx]
+                engine_info[anchor_msg_key] = anchor_activated_list[idx]
 
             # Keep runtime token-length metadata for this request message so
             # kv_reuse span reconstruction can align to current prompt.
@@ -1381,6 +1421,8 @@ class PagedLLMChat(LLM):
                 message=message,
                 block_table=candidate_blocks,
                 num_tokens=candidate_num,
+                max_anchor_num=self.config.max_anchor_num,
+                window_length=self.config.window_size,
             )
             if created:
                 logger.info(
@@ -1485,12 +1527,14 @@ class PagedLLMChat(LLM):
         message_key = self._message_cache_key(message)
 
         if not prob:
+            engine_info = self.paged_kv_engine.anchor_info.setdefault(anchor_key, {})
             for idx, anchor_msg_key in enumerate(anchor_messages):
                 if idx >= len(anchor_activated_list):
                     break
                 cond_info_bucket[anchor_msg_key] = anchor_activated_list[idx]
                 bucket_entry = global_bucket.setdefault(anchor_msg_key, [0, 0])
                 bucket_entry[0] = anchor_activated_list[idx]
+                engine_info[anchor_msg_key] = anchor_activated_list[idx]
             global_bucket[message] = [0, candidate_num]
             global_bucket[message_key] = [0, candidate_num]
         else:
@@ -1500,6 +1544,8 @@ class PagedLLMChat(LLM):
                     message=message,
                     block_table=candidate_blocks,
                     num_tokens=candidate_num,
+                    max_anchor_num=self.config.max_anchor_num,
+                    window_length=self.config.window_size,
                 )
                 if created:
                     safe_msg = _escape_loguru_markup(message)

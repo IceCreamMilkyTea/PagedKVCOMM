@@ -135,6 +135,9 @@ class PagedKVCOMMEngine:
 
         # Anchor store: ph_id → message → PagedAnchorEntry
         self.anchors: Dict[str, Dict[str, PagedAnchorEntry]] = {}
+        # Anchor activation counts: ph_id → message → activation_count
+        # Used by evict_anchor to identify least-used anchors.
+        self.anchor_info: Dict[str, Dict[str, int]] = {}
         self._lock = threading.Lock()
 
     # ─────────────────────── Block-level KV read/write ───────────────────────
@@ -221,15 +224,25 @@ class PagedKVCOMMEngine:
             )
 
     def allocate_blocks_for_tokens(self, num_tokens: int) -> List[int]:
-        """Allocate fresh blocks from the free pool for a given number of tokens."""
+        """Allocate fresh blocks from the free pool for a given number of tokens.
+
+        If the free pool is exhausted, attempts to evict least-used anchors
+        to reclaim blocks before raising.
+        """
         num_blocks_needed = (num_tokens + self.block_size - 1) // self.block_size
         block_ids = []
         for _ in range(num_blocks_needed):
             if not self.block_manager.free_block_ids:
-                raise RuntimeError(
-                    f"Not enough free blocks: need {num_blocks_needed}, "
-                    f"have {len(self.block_manager.free_block_ids)}"
-                )
+                # Try to reclaim blocks by evicting least-used anchors
+                remaining = num_blocks_needed - len(block_ids)
+                if not self.evict_until_free(remaining):
+                    # Free any partially allocated blocks before raising
+                    self.free_blocks(block_ids)
+                    raise RuntimeError(
+                        f"Not enough free blocks: need {num_blocks_needed}, "
+                        f"have {len(self.block_manager.free_block_ids)} "
+                        f"(even after eviction)"
+                    )
             bid = self.block_manager.free_block_ids[0]
             block = self.block_manager._allocate_block(bid)
             block_ids.append(bid)
@@ -256,6 +269,8 @@ class PagedKVCOMMEngine:
         message: str,
         block_table: List[int],
         num_tokens: int,
+        max_anchor_num: int = 20,
+        window_length: int = 5,
     ) -> bool:
         """Register a base anchor entry directly from existing blocks.
 
@@ -275,6 +290,10 @@ class PagedKVCOMMEngine:
             if message in ph_store:
                 return False
 
+            # Evict if over capacity
+            if len(ph_store) >= max_anchor_num:
+                self.evict_anchor(ph_id, window_length)
+
             self.increment_ref(block_table)
             ph_store[message] = PagedAnchorEntry(
                 block_table=list(block_table),
@@ -282,6 +301,7 @@ class PagedKVCOMMEngine:
                 ph_key_embedding=ph_key,
                 ph_value_embedding=ph_val,
             )
+            self.anchor_info.setdefault(ph_id, {})[message] = 0
             return True
 
     def set_anchor(
@@ -297,6 +317,8 @@ class PagedKVCOMMEngine:
         real_prefix_num_tokens: int,
         base_prefix_block_table: List[int],
         base_prefix_num_tokens: int,
+        max_anchor_num: int = 20,
+        window_length: int = 5,
     ) -> None:
         """Store an anchor entry using block references + delta.
 
@@ -316,6 +338,10 @@ class PagedKVCOMMEngine:
             ph_store = self.anchors.setdefault(ph_id, {})
 
             if message not in ph_store:
+                # Evict if over capacity
+                if len(ph_store) >= max_anchor_num:
+                    self.evict_anchor(ph_id, window_length)
+
                 # New anchor: store base embedding + block reference
                 self.increment_ref(base_block_table)
                 entry = PagedAnchorEntry(
@@ -325,6 +351,7 @@ class PagedKVCOMMEngine:
                     ph_value_embedding=base_ph_val,
                 )
                 ph_store[message] = entry
+                self.anchor_info.setdefault(ph_id, {})[message] = 0
             else:
                 entry = ph_store[message]
 
@@ -478,6 +505,176 @@ class PagedKVCOMMEngine:
 
         return new_ph_blocks, base_ph_num_tokens, new_pf_blocks, base_pf_num_tokens
 
+    # ── Local-reference offset (inner-round optimisation) ─────────────
+
+    def offset_kv_cache_local_ref(
+        self,
+        agent_id: str,
+        ph_id: str,
+        message: str,
+        base_ph_block_table: List[int],
+        base_ph_num_tokens: int,
+        base_pf_block_table: List[int],
+        base_pf_num_tokens: int,
+        anchor_list: List[str],
+        upstream_agent_id: str,
+        temperature: float = 1.0,
+    ) -> Tuple[List[int], int, List[int], int]:
+        """Paged local-reference offset: use upstream agent's KV as reference.
+
+        approx = upstream_KV + Σ(w_k × (delta_target_k − delta_upstream_k))
+
+        Falls back to base-reference offset when upstream data is unavailable.
+        """
+        ph_store = self.anchors.get(ph_id, {})
+
+        # 1. Check upstream delta exists for the CURRENT message
+        current_entry = ph_store.get(message)
+        if current_entry is None or upstream_agent_id not in current_entry.agent_deltas:
+            return self.offset_kv_cache(
+                agent_id, ph_id, message,
+                base_ph_block_table, base_ph_num_tokens,
+                base_pf_block_table, base_pf_num_tokens,
+                anchor_list, temperature,
+            )
+
+        # 2. Collect anchors with BOTH target and upstream deltas
+        valid_anchors = []
+        for msg in anchor_list:
+            entry = ph_store.get(msg)
+            if entry is None:
+                continue
+            if agent_id not in entry.agent_deltas or upstream_agent_id not in entry.agent_deltas:
+                continue
+            tgt_info = entry.agent_deltas[agent_id]
+            up_info = entry.agent_deltas[upstream_agent_id]
+            if entry.num_tokens < base_ph_num_tokens:
+                continue
+            if int(tgt_info.get("ph_delta_num_tokens", 0) or 0) < base_ph_num_tokens:
+                continue
+            if int(up_info.get("ph_delta_num_tokens", 0) or 0) < base_ph_num_tokens:
+                continue
+            valid_anchors.append((msg, entry))
+
+        if not valid_anchors:
+            return self.offset_kv_cache(
+                agent_id, ph_id, message,
+                base_ph_block_table, base_ph_num_tokens,
+                base_pf_block_table, base_pf_num_tokens,
+                anchor_list, temperature,
+            )
+
+        # 3. Read base KV + upstream delta for CURRENT message → exact upstream KV
+        base_ph_key, base_ph_val = self.read_kv_from_blocks(
+            base_ph_block_table, base_ph_num_tokens
+        )
+
+        up_cur_info = current_entry.agent_deltas[upstream_agent_id]
+        up_cur_dk, up_cur_dv = self.read_kv_from_blocks(
+            up_cur_info["ph_delta_blocks"], base_ph_num_tokens,
+        )
+        upstream_ph_key = base_ph_key + up_cur_dk[..., :base_ph_num_tokens, :]
+        upstream_ph_val = base_ph_val + up_cur_dv[..., :base_ph_num_tokens, :]
+
+        # 4. Compute similarity weights (same as base-ref path)
+        sims_list = []
+        for _, entry in valid_anchors:
+            anchor_key = entry.ph_key_embedding[..., -base_ph_num_tokens:, :]
+            if anchor_key.device != base_ph_key.device:
+                anchor_key = anchor_key.to(base_ph_key.device, non_blocking=True)
+            sims_list.append((base_ph_key - anchor_key).norm(2, dim=-2))
+        sims = torch.stack(sims_list, dim=0)
+        weights = torch.softmax(-sims.float() / temperature, dim=0).unsqueeze(-2)
+
+        # 5. Weighted sum of cross-deltas (placeholder)
+        cross_sum_k = torch.zeros_like(base_ph_key)
+        cross_sum_v = torch.zeros_like(base_ph_val)
+        for i, (msg, entry) in enumerate(valid_anchors):
+            tgt_dk, tgt_dv = self.read_kv_from_blocks(
+                entry.agent_deltas[agent_id]["ph_delta_blocks"], base_ph_num_tokens,
+            )
+            up_dk, up_dv = self.read_kv_from_blocks(
+                entry.agent_deltas[upstream_agent_id]["ph_delta_blocks"], base_ph_num_tokens,
+            )
+            w = weights[i]
+            cross_sum_k += w * (tgt_dk[..., :base_ph_num_tokens, :] - up_dk[..., :base_ph_num_tokens, :])
+            cross_sum_v += w * (tgt_dv[..., :base_ph_num_tokens, :] - up_dv[..., :base_ph_num_tokens, :])
+
+        # 6. Apply: result = upstream_KV + cross_delta
+        new_ph_key = upstream_ph_key + cross_sum_k.to(upstream_ph_key.dtype)
+        new_ph_val = upstream_ph_val + cross_sum_v.to(upstream_ph_val.dtype)
+        new_ph_key[0] = base_ph_key[0]
+        new_ph_val[0] = base_ph_val[0]
+
+        new_ph_blocks = self.allocate_blocks_for_tokens(base_ph_num_tokens)
+        self.write_kv_to_blocks(new_ph_blocks, new_ph_key, new_ph_val, base_ph_num_tokens)
+
+        # 7. Prefix: cross-delta or fallback
+        base_pf_key, base_pf_val = self.read_kv_from_blocks(
+            base_pf_block_table, base_pf_num_tokens
+        )
+
+        has_pf = base_pf_num_tokens > 0 and all(
+            upstream_agent_id in entry.agent_deltas
+            and int(entry.agent_deltas[upstream_agent_id].get("pf_delta_num_tokens", 0) or 0) >= base_pf_num_tokens
+            and int(entry.agent_deltas[agent_id].get("pf_delta_num_tokens", 0) or 0) >= base_pf_num_tokens
+            for _, entry in valid_anchors
+        )
+        up_cur_has_pf = (
+            base_pf_num_tokens > 0
+            and int(up_cur_info.get("pf_delta_num_tokens", 0) or 0) >= base_pf_num_tokens
+        )
+
+        if has_pf and up_cur_has_pf:
+            up_pf_dk, up_pf_dv = self.read_kv_from_blocks(
+                up_cur_info["pf_delta_blocks"], base_pf_num_tokens,
+            )
+            upstream_pf_key = base_pf_key + up_pf_dk[..., :base_pf_num_tokens, :]
+            upstream_pf_val = base_pf_val + up_pf_dv[..., :base_pf_num_tokens, :]
+
+            pf_cross_k = torch.zeros_like(base_pf_key)
+            pf_cross_v = torch.zeros_like(base_pf_val)
+            for i, (msg, entry) in enumerate(valid_anchors):
+                tgt_dk, tgt_dv = self.read_kv_from_blocks(
+                    entry.agent_deltas[agent_id]["pf_delta_blocks"], base_pf_num_tokens,
+                )
+                up_dk, up_dv = self.read_kv_from_blocks(
+                    entry.agent_deltas[upstream_agent_id]["pf_delta_blocks"], base_pf_num_tokens,
+                )
+                w = weights[i]
+                pf_cross_k += w * (tgt_dk - up_dk)
+                pf_cross_v += w * (tgt_dv - up_dv)
+
+            new_pf_key = upstream_pf_key + pf_cross_k.to(upstream_pf_key.dtype)
+            new_pf_val = upstream_pf_val + pf_cross_v.to(upstream_pf_val.dtype)
+        else:
+            # Prefix fallback: base-reference
+            pf_delta_k = torch.zeros_like(base_pf_key)
+            pf_delta_v = torch.zeros_like(base_pf_val)
+            for i, (msg, entry) in enumerate(valid_anchors):
+                dk, dv = self.read_kv_from_blocks(
+                    entry.agent_deltas[agent_id]["pf_delta_blocks"], base_pf_num_tokens,
+                )
+                w = weights[i]
+                pf_delta_k += w * dk
+                pf_delta_v += w * dv
+            new_pf_key = base_pf_key + pf_delta_k.to(base_pf_key.dtype)
+            new_pf_val = base_pf_val + pf_delta_v.to(base_pf_val.dtype)
+
+        new_pf_key[0] = base_pf_key[0]
+        new_pf_val[0] = base_pf_val[0]
+
+        new_pf_blocks = self.allocate_blocks_for_tokens(base_pf_num_tokens)
+        self.write_kv_to_blocks(new_pf_blocks, new_pf_key, new_pf_val, base_pf_num_tokens)
+
+        logger.opt(colors=True).info(
+            f"<green>[LOCAL_REF:paged] APPLIED | agent={agent_id} ph_id={ph_id} | "
+            f"upstream={upstream_agent_id} | anchors_used={len(valid_anchors)} | "
+            f"ph_tokens={base_ph_num_tokens}</green>"
+        )
+
+        return new_ph_blocks, base_ph_num_tokens, new_pf_blocks, base_pf_num_tokens
+
     def predict_as_anchor(
         self,
         ph_id: str,
@@ -615,6 +812,66 @@ class PagedKVCOMMEngine:
         for agent_id, delta_info in entry.agent_deltas.items():
             self.free_blocks(delta_info.get("ph_delta_blocks", []))
             self.free_blocks(delta_info.get("pf_delta_blocks", []))
+
+        # Clean up activation tracking
+        info_store = self.anchor_info.get(ph_id, {})
+        info_store.pop(message, None)
+
+    def evict_anchor(self, ph_id: str, window_length: int = 5) -> bool:
+        """Evict the least-activated anchor within a window for a given ph_id.
+
+        Mirrors KVCOMMEngine.update_anchor(): looks at the oldest `window_length`
+        anchors (by insertion order) and removes the one with the lowest
+        activation count, freeing its blocks back to the pool.
+
+        Returns True if an anchor was evicted, False otherwise.
+        """
+        ph_store = self.anchors.get(ph_id, {})
+        if not ph_store:
+            return False
+
+        info_store = self.anchor_info.get(ph_id, {})
+        # Look at the oldest window_length anchors (dict preserves insertion order)
+        messages = list(ph_store.keys())[:window_length]
+        if not messages:
+            return False
+
+        # Find the message with the lowest activation count
+        min_count = float("inf")
+        min_msg = messages[0]
+        for msg in messages:
+            count = info_store.get(msg, 0)
+            if count < min_count:
+                min_count = count
+                min_msg = msg
+
+        logger.info(
+            "[ANCHOR_EVICT:paged] ph_id={} evicted_message={} activation_count={} "
+            "remaining_anchors={}",
+            ph_id, min_msg[:80], min_count, len(ph_store) - 1,
+        )
+        self.free_anchor(ph_id, min_msg)
+        return True
+
+    def evict_until_free(self, num_blocks_needed: int, window_length: int = 5) -> bool:
+        """Evict anchors across all ph_ids until enough free blocks are available.
+
+        Returns True if enough blocks were freed, False otherwise.
+        """
+        while len(self.block_manager.free_block_ids) < num_blocks_needed:
+            # Find the ph_id with the most anchors to evict from
+            evicted = False
+            best_ph_id = None
+            best_count = 0
+            for ph_id, ph_store in self.anchors.items():
+                if len(ph_store) > best_count:
+                    best_count = len(ph_store)
+                    best_ph_id = ph_id
+            if best_ph_id is not None and best_count > 0:
+                evicted = self.evict_anchor(best_ph_id, window_length)
+            if not evicted:
+                return False
+        return True
 
     def get_memory_stats(self) -> Dict[str, int]:
         """Return memory usage statistics."""

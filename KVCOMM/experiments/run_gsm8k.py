@@ -95,6 +95,7 @@ def parse_args():
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
     parser.add_argument("--use-flash-attention", action="store_true", help="Use Flash Attention 2 for LLMChat backend.")
+    parser.add_argument("--use-local-reference", action="store_true", help="Use upstream agent KV as local reference for inner-round offset.")
     args = parser.parse_args()
 
     if len(args.agent_names) != len(args.agent_nums):
@@ -129,6 +130,7 @@ async def main():
             window_size=args.kv_window_size,
             thread_pool_workers=args.kv_thread_workers,
             worker_timeout=args.kv_worker_timeout,
+            use_local_reference=args.use_local_reference or None,
         )
     else:
         kv_config = KVCommConfig.from_env()
@@ -233,6 +235,22 @@ async def main():
         )
         logger.opt(colors=True).info(f"<blue>[ACCURACY]</blue> {accuracy:.4f}")
         metrics_recorder.log_cumulative(batch_index=i_batch)
+
+    # ── Delta similarity diagnostic (cross-agent offset analysis) ──
+    if args.execution_mode == "allow_kv_reuse":
+        try:
+            import importlib.util
+            _diag_path = os.path.join(REPO_ROOT, "scripts", "diagnose_delta_similarity.py")
+            _spec = importlib.util.spec_from_file_location("diagnose_delta_similarity", _diag_path)
+            _mod = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(_mod)
+            diag_dir = str(output_dir / "delta_diagnostic")
+            logger.info("[DIAGNOSTIC] Running cross-agent delta similarity analysis → {}", diag_dir)
+            _mod.run_diagnostic(output_dir=diag_dir, backend="auto")
+        except Exception as e:
+            logger.warning("[DIAGNOSTIC] Delta analysis failed: {}", e)
+            import traceback
+            traceback.print_exc()
 
 
 def get_kwargs(
