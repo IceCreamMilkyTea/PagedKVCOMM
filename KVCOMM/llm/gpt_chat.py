@@ -631,6 +631,23 @@ class LLMChat(LLM):
             )
 
             if has_flag is True and not has_delta:
+                # CRS bypass: if upstream agent already has a delta for this message
+                # and CRS is enabled, allow kv_reuse (same logic as paged has_active_anchor).
+                crs_on = getattr(getattr(self, "config", None), "use_current_round_sharing", True)
+                if crs_on and ph_id == "user_question":
+                    anchor_entry = state.anchors.get(ph_id, {}).get(message, {})
+                    has_upstream = any(
+                        k.endswith("_ph_key_delta") and not k.startswith(f"{self.node_id}_")
+                        for k in anchor_entry
+                    )
+                    if has_upstream:
+                        logger.info(
+                            "[ANCHOR_CHECK:hf] node={} ph_id={} "
+                            "has_upstream_delta=True -> allow kv_reuse (current-round sharing)",
+                            getattr(self, "node_id", "?"),
+                            ph_id,
+                        )
+                        continue
                 # New anchor and agent hasn't dense prefill and store the context delta, so trigger dense prefill for the first time.
                 return True
         logger.info(

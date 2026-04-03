@@ -1491,6 +1491,19 @@ class KVCOMMEngine:
         """Rotate and offset a single placeholder/prefix segment for kv_reuse mode."""
         new_ph, new_pf = self._rotate_segment_caches(m)
 
+        # Route: CRS (current-round sharing) — checked before local-ref and base-ref
+        crs_on = getattr(getattr(self.llm, "config", None), "use_current_round_sharing", True)
+        if crs_on and m["ph_id"] == "user_question":
+            upstream_id = self._find_upstream_agent(request_uid, m["ph_id"], message)
+            if upstream_id is not None:
+                new_ph, new_pf = self._apply_crs_offset(
+                    m["ph_id"], message, request_uid,
+                    new_ph, new_pf, anchors_for_ph, upstream_id,
+                )
+                seg_cache = new_ph.concat_([new_pf])
+                seg_token_ids = concat(self.trim_token_ids(m["ph_cache_ids"], m["drop_num"]), m["pf_ids"])
+                return m["idx"], seg_cache, seg_token_ids
+
         # Route: local-reference or base-reference
         use_local = getattr(self.llm, "config", None) and self.llm.config.use_local_reference
         if use_local:
@@ -1536,6 +1549,97 @@ class KVCOMMEngine:
                 if agent != node_id:
                     return agent
         return None
+
+    def _apply_crs_offset(
+        self,
+        ph_id: str,
+        message: str,
+        request_uid: str,
+        base_placeholder_cache: DynamicCache,
+        base_prefix_cache: DynamicCache,
+        anchor_list: List[Dict],
+        upstream_agent_id: str,
+    ) -> Tuple[DynamicCache, DynamicCache]:
+        """Approximate self's placeholder KV using upstream agent's current-round delta.
+
+        Mirrors paged CRS math exactly (paged_llm_chat.py _prepare_kv_reuse_prefix_blocks Path 1):
+            new_k = base_k + (up_dk - cross_k)
+        where:
+            cross_k = Σ(w_i × (up_hist_k_i - self_hist_k_i))   [0 when no history]
+
+        Only the placeholder cache is modified; prefix cache is returned unchanged.
+        Falls back to (base_placeholder_cache, base_prefix_cache) on any error.
+        """
+        node_id = self.llm.node_id
+        up_ph_key = f"{upstream_agent_id}_ph_key_delta"
+        up_ph_val = f"{upstream_agent_id}_ph_value_delta"
+        self_ph_key = f"{node_id}_ph_key_delta"
+        self_ph_val = f"{node_id}_ph_value_delta"
+
+        try:
+            state = self.resolve_request_state(request_uid)
+            current_entry = state.anchors.get(ph_id, {}).get(message)
+            if current_entry is None or up_ph_key not in current_entry:
+                return base_placeholder_cache, base_prefix_cache
+
+            placeholder_len = _safe_seq_len(base_placeholder_cache)
+            if placeholder_len <= 0:
+                return base_placeholder_cache, base_prefix_cache
+
+            base_k, base_v = self._stack_cache_tensors(base_placeholder_cache)
+            up_dk = current_entry[up_ph_key][..., :placeholder_len, :].to(base_k.dtype)
+            up_dv = current_entry[up_ph_val][..., :placeholder_len, :].to(base_v.dtype)
+
+            # Historical cross-delta: entries where BOTH upstream and self have deltas
+            # (excluding the current-round entry)
+            hist = [
+                entry for entry in anchor_list
+                if entry is not current_entry
+                and up_ph_key in entry
+                and self_ph_key in entry
+                and entry[up_ph_key].shape[-2] >= placeholder_len
+                and entry[self_ph_key].shape[-2] >= placeholder_len
+            ]
+
+            cross_k = torch.zeros_like(up_dk)
+            cross_v = torch.zeros_like(up_dv)
+            if hist:
+                # Weights via L2 norm on token dim — same as paged CRS
+                base_k_ph = base_k[..., -placeholder_len:, :]
+                sims = torch.stack([
+                    (base_k_ph - entry["ph_key_embedding"][..., -placeholder_len:, :].to(
+                        base_k_ph.device, non_blocking=True)
+                    ).norm(2, dim=-2)
+                    for entry in hist
+                ], dim=0)
+                weights = torch.softmax(-sims.float(), dim=0).unsqueeze(-2)
+                for i, entry in enumerate(hist):
+                    w = weights[i]
+                    up_h_k = entry[up_ph_key][..., :placeholder_len, :].to(base_k.device)
+                    sl_h_k = entry[self_ph_key][..., :placeholder_len, :].to(base_k.device)
+                    up_h_v = entry[up_ph_val][..., :placeholder_len, :].to(base_v.device)
+                    sl_h_v = entry[self_ph_val][..., :placeholder_len, :].to(base_v.device)
+                    cross_k = cross_k + w * (up_h_k - sl_h_k)
+                    cross_v = cross_v + w * (up_h_v - sl_h_v)
+
+            new_k = base_k + (up_dk - cross_k).to(base_k.dtype)
+            new_v = base_v + (up_dv - cross_v).to(base_v.dtype)
+            new_k[0] = base_k[0]  # layer-0 convention
+            new_v[0] = base_v[0]
+
+            new_ph = base_placeholder_cache.copy()
+            _assign_stack_to_cache(new_ph, new_k, new_v)
+            _set_seen_tokens(new_ph, placeholder_len)
+
+            logger.info(
+                "[CRS:hf] APPLIED | node={} ph_id={} upstream={} ph_tokens={} hist={}",
+                node_id, ph_id, upstream_agent_id, placeholder_len, len(hist),
+            )
+            return new_ph, base_prefix_cache
+
+        except Exception as exc:
+            logger.warning("[CRS:hf] error: {}; falling back to base cache", exc)
+            return base_placeholder_cache, base_prefix_cache
 
     def process_anchor(
         self,
