@@ -443,16 +443,25 @@ class PagedLLMChat(LLM):
         return seq.completion_token_ids, ttft, prefill_latency, seq
 
     def _find_upstream_agent_paged(self, ph_id: str, message: str) -> Optional[str]:
-        """Find an agent that already stored a delta for this message (upstream ref).
+        """Find an agent that co-appears with self in a historical anchor for ph_id.
 
-        Returns the first agent_id that is not self.node_id, or None.
+        Only considers anchor entries where self.node_id also has a delta, so
+        the returned agent_id is guaranteed to be usable in valid_anchors.
+
+        Returns the first such agent_id that is not self.node_id, or None.
         """
-        entry = self.paged_kv_engine.anchors.get(ph_id, {}).get(message)
-        if entry is None:
-            return None
-        for agent_id in entry.agent_deltas:
-            if agent_id != self.node_id:
-                return agent_id
+        ph_store = self.paged_kv_engine.anchors.get(ph_id, {})
+        logger.info(
+            "[UPSTREAM_SEARCH] self={} ph_id={} ph_store_keys={} entries_agent_ids={}",
+            self.node_id, ph_id, len(ph_store),
+            [{k: list(e.agent_deltas.keys()) for k, e in ph_store.items()}],
+        )
+        for entry in ph_store.values():
+            if self.node_id not in entry.agent_deltas:
+                continue
+            for agent_id in entry.agent_deltas:
+                if agent_id != self.node_id:
+                    return agent_id
         return None
 
     def _prepare_kv_reuse_prefix_blocks(
@@ -464,6 +473,12 @@ class PagedLLMChat(LLM):
         message_key: str,
     ) -> Tuple[Optional[List[int]], int, Dict[str, Any]]:
         """Build pre-injected cached prefix blocks for kv_reuse mode.
+
+        Processes ALL valid placeholder spans in token order:
+          1. Current-round sharing: base + (delta_upstream_current - cross_delta_hist)
+          2. KVCOMM anchor matching: weighted historical delta (pf_num=0 per span)
+          3. Fallback: base template blocks (ref-incremented)
+        Gaps between spans and the tail are filled with base blocks.
 
         Returns (block_table, cached_tokens, stats).
         """
@@ -483,118 +498,199 @@ class PagedLLMChat(LLM):
             stats["fallback_reason"] = "no_placeholder_info"
             return None, 0, stats
 
-        # We offset one effective placeholder span per request. For multi-placeholder
-        # prompts, prefer user_question if available, otherwise choose the last valid
-        # placeholder by position (closest to generation tail).
-        valid_ph_items = [
-            (ph_id, span)
-            for ph_id, span in sorted(placeholder_info.items(), key=lambda x: x[1][0])
-            if span[0] >= 0 and span[1] > span[0] and span[1] <= prompt_num_tokens
-        ]
+        bs = self.paged_kv_engine.block_size
+        expected_blocks = (prompt_num_tokens + bs - 1) // bs
+
+        # All valid spans sorted by token start position
+        valid_ph_items = sorted(
+            [
+                (ph_id, span)
+                for ph_id, span in placeholder_info.items()
+                if span[0] >= 0 and span[1] > span[0] and span[1] <= prompt_num_tokens
+            ],
+            key=lambda x: x[1][0],
+        )
         if not valid_ph_items:
             stats["fallback_reason"] = "no_valid_placeholder_span"
             return None, 0, stats
 
-        ph_items = [item for item in valid_ph_items if item[0] == "user_question"]
-        if ph_items:
-            ph_id, (ph_start, ph_end) = ph_items[0]
-        else:
-            ph_id, (ph_start, ph_end) = valid_ph_items[-1]
-        anchor_messages = list(self.paged_kv_engine.anchors.get(ph_id, {}).keys())
-        stats["anchor_candidates"] = len(anchor_messages)
-        if not anchor_messages:
-            stats["fallback_reason"] = "no_anchor_messages"
-            return None, 0, stats
+        combined_blocks: List[int] = []
+        to_free: List[List[int]] = []   # every block list with a live extra ref
+        current_block = 0               # next unprocessed block index
+        any_offset = False
 
-        bs = self.paged_kv_engine.block_size
-        ph_start_block = ph_start // bs
-        ph_end_block = (ph_end - 1) // bs + 1
-        pf_start = ph_end
-        pf_end = prompt_num_tokens
+        def _cleanup() -> None:
+            for blks in to_free:
+                try:
+                    self.paged_kv_engine.free_blocks(blks)
+                except Exception:
+                    pass
 
-        if ph_start_block >= len(base_block_table):
-            stats["fallback_reason"] = "placeholder_out_of_base_range"
-            return None, 0, stats
+        try:
+            for ph_id, (ph_start, ph_end) in valid_ph_items:
+                ph_start_block = ph_start // bs
+                ph_end_block = (ph_end - 1) // bs + 1
+                ph_num = ph_end - ph_start
 
-        base_ph_blocks = base_block_table[ph_start_block:ph_end_block]
-        ph_num = ph_end - ph_start
-        pf_num = max(0, pf_end - pf_start)
-        if pf_num > 0:
-            pf_start_block = pf_start // bs
-            pf_end_block = (pf_end - 1) // bs + 1
-            base_pf_blocks = base_block_table[pf_start_block:pf_end_block]
-        else:
-            base_pf_blocks = []
+                # Skip if invalid or overlapping with the previous span's blocks
+                if (ph_start_block < current_block
+                        or ph_start_block >= len(base_block_table)
+                        or ph_num <= 0):
+                    continue
 
-        if ph_num <= 0 or not base_ph_blocks:
-            stats["fallback_reason"] = "invalid_placeholder_block_span"
-            return None, 0, stats
+                # ── gap: base blocks between current_block and this span ──────
+                gap = base_block_table[current_block:ph_start_block]
+                if gap:
+                    self.paged_kv_engine.increment_ref(gap)
+                    combined_blocks.extend(gap)
+                    to_free.append(gap)
 
-        stats["offset_calls"] += 1
+                base_ph_blocks = base_block_table[ph_start_block:ph_end_block]
+                if not base_ph_blocks:
+                    current_block = ph_end_block
+                    continue
 
-        # Route: local-reference or base-reference
-        use_local = getattr(self, "config", None) and self.config.use_local_reference
-        upstream_id = None
-        if use_local:
-            upstream_id = self._find_upstream_agent_paged(ph_id, message_key)
+                new_ph_blocks: Optional[List[int]] = None
 
-        if use_local and upstream_id is not None:
-            new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache_local_ref(
-                agent_id=self.node_id,
-                ph_id=ph_id,
-                message=message_key,
-                base_ph_block_table=base_ph_blocks,
-                base_ph_num_tokens=ph_num,
-                base_pf_block_table=base_pf_blocks,
-                base_pf_num_tokens=pf_num,
-                anchor_list=anchor_messages,
-                upstream_agent_id=upstream_id,
-                temperature=1.0,
-            )
-        else:
-            new_ph_blocks, _, new_pf_blocks, _ = self.paged_kv_engine.offset_kv_cache(
-                agent_id=self.node_id,
-                ph_id=ph_id,
-                message=message_key,
-                base_ph_block_table=base_ph_blocks,
-                base_ph_num_tokens=ph_num,
-                base_pf_block_table=base_pf_blocks,
-                base_pf_num_tokens=pf_num,
-                anchor_list=anchor_messages,
-                temperature=1.0,
-            )
+                # ── Path 1: current-round sharing (user_question only) ────────
+                # Only user_question has identical prefix across agents (cross-delta ≈ 0).
+                # Disabled when config.use_current_round_sharing is False.
+                _crs_enabled = (
+                    ph_id == "user_question"
+                    and getattr(getattr(self, "config", None), "use_current_round_sharing", True)
+                )
+                cur_entry = self.paged_kv_engine.anchors.get(ph_id, {}).get(message_key) \
+                    if _crs_enabled else None
+                if cur_entry is not None:
+                    up_candidates = sorted(
+                        aid for aid in cur_entry.agent_deltas if aid != self.node_id
+                    )
+                    if up_candidates:
+                        up_id = up_candidates[0]
+                        up_info = cur_entry.agent_deltas[up_id]
+                        if int(up_info.get("ph_delta_num_tokens", 0) or 0) >= ph_num:
+                            try:
+                                base_k, base_v = self.paged_kv_engine.read_kv_from_blocks(
+                                    base_ph_blocks, ph_num
+                                )
+                                up_dk, up_dv = self.paged_kv_engine.read_kv_from_blocks(
+                                    up_info["ph_delta_blocks"], ph_num
+                                )
+                                up_dk = up_dk[..., :ph_num, :]
+                                up_dv = up_dv[..., :ph_num, :]
 
-        if new_ph_blocks != base_ph_blocks or new_pf_blocks != base_pf_blocks:
-            stats["offset_effective"] += 1
+                                # Historical cross-delta: Σ w_k(delta_up_k − delta_self_k)
+                                ph_store = self.paged_kv_engine.anchors.get(ph_id, {})
+                                hist = [
+                                    (m, e) for m, e in ph_store.items()
+                                    if m != message_key
+                                    and up_id in e.agent_deltas
+                                    and self.node_id in e.agent_deltas
+                                    and int(e.agent_deltas[up_id].get("ph_delta_num_tokens", 0)) >= ph_num
+                                    and int(e.agent_deltas[self.node_id].get("ph_delta_num_tokens", 0)) >= ph_num
+                                ]
+                                cross_k = torch.zeros_like(up_dk)
+                                cross_v = torch.zeros_like(up_dv)
+                                if hist:
+                                    sims = torch.stack([
+                                        (base_k - e.ph_key_embedding[..., -ph_num:, :].to(
+                                            base_k.device, non_blocking=True)
+                                        ).norm(2, dim=-2)
+                                        for _, e in hist
+                                    ], dim=0)
+                                    weights = torch.softmax(-sims.float(), dim=0).unsqueeze(-2)
+                                    for i, (_, e) in enumerate(hist):
+                                        up_h_k, up_h_v = self.paged_kv_engine.read_kv_from_blocks(
+                                            e.agent_deltas[up_id]["ph_delta_blocks"], ph_num
+                                        )
+                                        sl_h_k, sl_h_v = self.paged_kv_engine.read_kv_from_blocks(
+                                            e.agent_deltas[self.node_id]["ph_delta_blocks"], ph_num
+                                        )
+                                        w = weights[i]
+                                        cross_k += w * (up_h_k[..., :ph_num, :] - sl_h_k[..., :ph_num, :])
+                                        cross_v += w * (up_h_v[..., :ph_num, :] - sl_h_v[..., :ph_num, :])
 
-        # Stitch full prompt prefix blocks: [before placeholder] + [offset placeholder] + [offset tail].
-        pre_blocks = base_block_table[:ph_start_block]
-        if pre_blocks:
-            self.paged_kv_engine.increment_ref(pre_blocks)
+                                new_k = base_k + (up_dk - cross_k)
+                                new_v = base_v + (up_dv - cross_v)
+                                new_k[0] = base_k[0]   # KVCOMM layer-0 convention
+                                new_v[0] = base_v[0]
+                                new_ph_blocks = self.paged_kv_engine.allocate_blocks_for_tokens(ph_num)
+                                self.paged_kv_engine.write_kv_to_blocks(
+                                    new_ph_blocks, new_k, new_v, ph_num
+                                )
+                                any_offset = True
+                                logger.info(
+                                    "[CUR_ROUND_SHARE:paged] node={} ph_id={} upstream={} "
+                                    "ph_num={} hist={}",
+                                    getattr(self, "node_id", "?"),
+                                    ph_id, up_id, ph_num, len(hist),
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "[CUR_ROUND_SHARE:paged] ph_id={} error: {}; trying KVCOMM",
+                                    ph_id, exc,
+                                )
+                                new_ph_blocks = None
 
-        combined_blocks = pre_blocks + list(new_ph_blocks) + list(new_pf_blocks)
-        expected_blocks = (prompt_num_tokens + bs - 1) // bs
-        if len(combined_blocks) != expected_blocks:
-            if pre_blocks:
-                self.paged_kv_engine.free_blocks(pre_blocks)
+                # ── Path 2: KVCOMM anchor matching (ph only, pf_num=0) ────────
+                if new_ph_blocks is None:
+                    anchor_msgs = [
+                        m for m in self.paged_kv_engine.anchors.get(ph_id, {}).keys()
+                        if m != message_key
+                    ]
+                    stats["anchor_candidates"] += len(anchor_msgs)
+                    if anchor_msgs:
+                        stats["offset_calls"] += 1
+                        result_ph, _, _, _ = self.paged_kv_engine.offset_kv_cache(
+                            agent_id=self.node_id,
+                            ph_id=ph_id,
+                            message=message_key,
+                            base_ph_block_table=base_ph_blocks,
+                            base_ph_num_tokens=ph_num,
+                            base_pf_block_table=[],
+                            base_pf_num_tokens=0,
+                            anchor_list=anchor_msgs,
+                            temperature=1.0,
+                        )
+                        new_ph_blocks = result_ph
+                        if result_ph != base_ph_blocks:
+                            any_offset = True
+                            stats["offset_effective"] += 1
 
-            # If offset returned base blocks (no-op), free only our temporary refs.
-            if new_ph_blocks == base_ph_blocks:
-                self.paged_kv_engine.free_blocks(new_ph_blocks)
-            else:
-                self.paged_kv_engine.free_blocks(new_ph_blocks)
-            if new_pf_blocks == base_pf_blocks:
-                self.paged_kv_engine.free_blocks(new_pf_blocks)
-            else:
-                self.paged_kv_engine.free_blocks(new_pf_blocks)
+                # ── Fallback: base template blocks ────────────────────────────
+                if new_ph_blocks is None:
+                    self.paged_kv_engine.increment_ref(base_ph_blocks)
+                    new_ph_blocks = base_ph_blocks
 
-            stats["fallback_reason"] = (
-                f"combined_blocks_mismatch:{len(combined_blocks)}!={expected_blocks}"
-            )
-            return None, 0, stats
+                to_free.append(new_ph_blocks)
+                combined_blocks.extend(new_ph_blocks)
+                current_block = ph_end_block
 
-        stats["offset_applied"] = True
-        return combined_blocks, prompt_num_tokens, stats
+            # ── tail: base blocks after the last span ─────────────────────────
+            tail = base_block_table[current_block:]
+            if tail:
+                self.paged_kv_engine.increment_ref(tail)
+                combined_blocks.extend(tail)
+                to_free.append(tail)
+
+            if len(combined_blocks) != expected_blocks:
+                _cleanup()
+                stats["fallback_reason"] = (
+                    f"combined_mismatch:{len(combined_blocks)}!={expected_blocks}"
+                )
+                return None, 0, stats
+
+            if not any_offset:
+                _cleanup()
+                stats["fallback_reason"] = "no_offset_applied"
+                return None, 0, stats
+
+            stats["offset_applied"] = True
+            return combined_blocks, prompt_num_tokens, stats
+
+        except Exception:
+            _cleanup()
+            raise
 
     # ── Prefix preparation (paged version) ──
 
@@ -653,6 +749,14 @@ class PagedLLMChat(LLM):
         scheduler.postprocess(seqs, [self.tokenizer.eos_token_id])
 
         mem = PagedLLMChat._shared_kv_cache_memory[node_id]
+        # Free old prefix segment blocks before overwriting to prevent block leak.
+        # Each segment block was increment_ref'd when first materialized; without
+        # this explicit free the ref_count never reaches 0 and the blocks stay
+        # pinned in the pool forever.
+        old_prefix_block_info = mem.get("prefix_block_info")
+        if old_prefix_block_info:
+            for seg in old_prefix_block_info:
+                self.paged_kv_engine.free_blocks(seg.get("block_table", []))
         mem["prefix_block_info"] = segment_block_info
         mem["prefix_block_table"] = full_block_table
         mem["prefix_num_tokens"] = full_num_tokens
@@ -992,6 +1096,15 @@ class PagedLLMChat(LLM):
                     if span[0] >= 0 and span[1] > span[0] and span[1] <= len(token_ids)
                 }
                 placeholder_source = "stored_template_filtered"
+                # Fallback: template spans may be stored from a long system+few-shot
+                # prompt that exceeds the current (user-only) generation prompt.
+                # In that case, reuse the runtime-aligned user_question span that
+                # was already computed for kv_reuse (from update_input_anchor metadata).
+                if not placeholder_info_for_anchor:
+                    uq_span = placeholder_info_for_reuse.get("user_question")
+                    if uq_span and uq_span[1] > uq_span[0] and uq_span[1] <= len(token_ids):
+                        placeholder_info_for_anchor = {"user_question": uq_span}
+                        placeholder_source = "runtime_reuse_span_fallback"
 
             logger.info(
                 "[PLACEHOLDER_SPAN:paged] node={} role={} request_uid={} source={} dynamic_count={} stored_count={} anchor_count={} prompt_tokens={}",
@@ -1109,7 +1222,9 @@ class PagedLLMChat(LLM):
                         )
                         continue
 
-                    if pf_num <= 0 or not pf_blocks:
+                    # pf_num=0 is allowed: placeholder ends at prompt end (e.g. user_question
+                    # is last in prompt). set_anchor handles pf_tokens=0 gracefully.
+                    if pf_num < 0:
                         _record_anchor_skip("prefix_blocks_out_of_range")
                         logger.info(
                             "dense_prefill: skipping set_anchor for {} — prefix blocks out of range "
@@ -1158,6 +1273,7 @@ class PagedLLMChat(LLM):
                             base_prefix_num_tokens=pf_num,
                             max_anchor_num=self.config.max_anchor_num,
                             window_length=self.config.window_size,
+                            free_ratio_threshold=self.config.proactive_evict_threshold,
                         )
                         reuse_stats["anchor_set_count"] += 1
                     else:
@@ -1599,6 +1715,23 @@ class PagedLLMChat(LLM):
                     not has_agent_delta,
                 )
                 if not has_agent_delta:
+                    # Before forcing dense_prefill, check if an upstream agent
+                    # already has a delta for this message in the current round.
+                    # If so, current-round sharing can approximate self's KV
+                    # (delta_self ≈ delta_upstream − cross_delta_historical),
+                    # so dense_prefill is not needed.
+                    crs_on = getattr(getattr(self, "config", None), "use_current_round_sharing", True)
+                    has_upstream_delta = crs_on and any(
+                        aid != self.node_id for aid in agent_deltas
+                    )
+                    if has_upstream_delta:
+                        logger.info(
+                            "[ANCHOR_CHECK:paged] node={} ph_id={} "
+                            "has_upstream_delta=True -> allow kv_reuse (current-round sharing)",
+                            getattr(self, "node_id", "?"),
+                            ph_id,
+                        )
+                        continue  # don't force dense_prefill; fall through to return False
                     return True
             else:
                 logger.info(

@@ -72,6 +72,8 @@ def parse_args():
     parser.add_argument("--kv-window-size", type=int, default=5, help="Window size for key-value memory update.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
+    parser.add_argument("--use-flash-attention", action="store_true", help="Use Flash Attention 2 for LLMChat backend.")
+    parser.add_argument("--num-rounds", type=int, default=1, help="Number of interactive communication rounds among agents.")
 
     args = parser.parse_args()
     result_path = Path(args.output_dir)
@@ -89,6 +91,7 @@ async def evaluate(
         graph: Graph,
         *,
         samples: int,
+        num_rounds: int = 1,
         output_dir: str,
         **kwargs
         ) -> List[Dict[str, Any]]:
@@ -105,7 +108,7 @@ async def evaluate(
         realized_graph = copy.deepcopy(graph)
         realized_graph.spatial_logits = graph.spatial_logits
         realized_graph.temporal_logits = graph.temporal_logits
-        tasks = [asyncio.create_task(realized_graph.arun(input_dict, **kwargs))]
+        tasks = [asyncio.create_task(realized_graph.arun(input_dict, num_rounds=num_rounds, **kwargs))]
         raw_results = await asyncio.gather(*tasks)
         all_results.extend(raw_results)
     print("Done!")
@@ -162,6 +165,7 @@ async def main():
         llm_name=args.llm_name,
         agent_names=agent_names,
         kv_config=kv_config,
+        use_flash_attention=args.use_flash_attention,
         **kwargs,
     )
 
@@ -174,6 +178,7 @@ async def main():
     _ = await evaluate(
         graph=graph,
         mode=args.execution_mode,
+        num_rounds=args.num_rounds,
         samples=args.samples,
         **eval_kwargs,
     )

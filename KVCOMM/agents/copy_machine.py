@@ -26,11 +26,12 @@ class CopyMachine(Node):
         domain: str = "",
         llm_name: str = "",
         llm_config: KVCommConfig | None = None,
+        use_flash_attention: bool = False,
     ):
         super().__init__(id, "CopyMachine" ,domain, llm_name)
         prefix = ""
 
-        self.llm = LLMRegistry.get(llm_name, prefix=prefix, llm_config=llm_config)
+        self.llm = LLMRegistry.get(llm_name, prefix=prefix, llm_config=llm_config, use_flash_attention=use_flash_attention)
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role = self.prompt_set.get_role() if role is None else role
         self.llm.set_id(self.id, self.role)

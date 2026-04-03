@@ -932,39 +932,32 @@ class KVCOMMEngine:
         weights_key_for_placeholder = cache_entry["weights_key_for_placeholder"]
         weights_value_for_placeholder = cache_entry["weights_value_for_placeholder"]
 
-        prefix_key_delta_stack = torch.stack(
-            [anchor_list[i][f"{self.llm.node_id}_pf_key_delta"] for i in anchor_index]
-        )
-        layer_total_delta_key_for_prefix = (
-            weights_key_for_prefix * prefix_key_delta_stack
-        ).sum(0)
+        # Read prefix base tensors once, then accumulate weighted delta sums one
+        # anchor at a time — avoids materialising an [N, L, H, T, D] stack on
+        # GPU that caused OOM when anchor_index is large.
+        base_prefix_key, base_prefix_value = self._stack_cache_tensors(base_prefix_cache)
 
-        prefix_value_delta_stack = torch.stack(
-            [anchor_list[i][f"{self.llm.node_id}_pf_value_delta"] for i in anchor_index]
-        )
-        layer_total_value_delta_for_prefix = (
-            weights_value_for_prefix * prefix_value_delta_stack
-        ).sum(0)
+        layer_total_delta_key_for_prefix = torch.zeros_like(base_prefix_key)
+        layer_total_value_delta_for_prefix = torch.zeros_like(base_prefix_value)
+        for i, idx in enumerate(anchor_index):
+            layer_total_delta_key_for_prefix += (
+                weights_key_for_prefix[i] * anchor_list[idx][f"{self.llm.node_id}_pf_key_delta"]
+            )
+            layer_total_value_delta_for_prefix += (
+                weights_value_for_prefix[i] * anchor_list[idx][f"{self.llm.node_id}_pf_value_delta"]
+            )
 
-        placeholder_key_delta_stack = torch.stack(
-            [
-                anchor_list[i][f"{self.llm.node_id}_ph_key_delta"][..., :placeholder_len, :]
-                for i in anchor_index
-            ]
-        )
-        layer_total_delta_key_for_placeholder = (
-            weights_key_for_placeholder * placeholder_key_delta_stack
-        ).sum(0)
-
-        placeholder_value_delta_stack = torch.stack(
-            [
-                anchor_list[i][f"{self.llm.node_id}_ph_value_delta"][..., :placeholder_len, :]
-                for i in anchor_index
-            ]
-        )
-        layer_total_value_delta_for_placeholder = (
-            weights_value_for_placeholder * placeholder_value_delta_stack
-        ).sum(0)
+        layer_total_delta_key_for_placeholder = torch.zeros_like(real_key_embedding[..., :placeholder_len, :])
+        layer_total_value_delta_for_placeholder = torch.zeros_like(real_value_embedding[..., :placeholder_len, :])
+        for i, idx in enumerate(anchor_index):
+            layer_total_delta_key_for_placeholder += (
+                weights_key_for_placeholder[i]
+                * anchor_list[idx][f"{self.llm.node_id}_ph_key_delta"][..., :placeholder_len, :]
+            )
+            layer_total_value_delta_for_placeholder += (
+                weights_value_for_placeholder[i]
+                * anchor_list[idx][f"{self.llm.node_id}_ph_value_delta"][..., :placeholder_len, :]
+            )
 
         new_placeholder_cache = base_placeholder_cache.copy()
         updated_placeholder_key = (
@@ -978,8 +971,6 @@ class KVCOMMEngine:
         updated_placeholder_value[0] = real_value_embedding[0]
         _assign_stack_to_cache(new_placeholder_cache, updated_placeholder_key, updated_placeholder_value)
         _set_seen_tokens(new_placeholder_cache, _safe_seq_len(base_placeholder_cache))
-
-        base_prefix_key, base_prefix_value = self._stack_cache_tensors(base_prefix_cache)
 
         new_prefix_cache = base_prefix_cache.copy()
         updated_prefix_key = base_prefix_key + layer_total_delta_key_for_prefix.to(base_prefix_key.dtype)

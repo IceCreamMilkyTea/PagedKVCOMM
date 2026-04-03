@@ -96,6 +96,10 @@ def parse_args():
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
     parser.add_argument("--use-flash-attention", action="store_true", help="Use Flash Attention 2 for LLMChat backend.")
     parser.add_argument("--use-local-reference", action="store_true", help="Use upstream agent KV as local reference for inner-round offset.")
+    parser.add_argument("--local-ref-mode", type=str, default=None, choices=["no_check", "cross_delta_consistency", "weight_confidence"], help="Similarity gate mode for local reference.")
+    parser.add_argument("--local-ref-consistency-threshold", type=float, default=None, help="Max relative std for cross_delta_consistency gate.")
+    parser.add_argument("--local-ref-weight-threshold", type=float, default=None, help="Min max-weight for weight_confidence gate.")
+    parser.add_argument("--no-current-round-sharing", action="store_true", help="Disable current-round KV sharing (ablation baseline).")
     args = parser.parse_args()
 
     if len(args.agent_names) != len(args.agent_nums):
@@ -131,6 +135,10 @@ async def main():
             thread_pool_workers=args.kv_thread_workers,
             worker_timeout=args.kv_worker_timeout,
             use_local_reference=args.use_local_reference or None,
+            local_ref_mode=args.local_ref_mode,
+            local_ref_consistency_threshold=args.local_ref_consistency_threshold,
+            local_ref_weight_threshold=args.local_ref_weight_threshold,
+            use_current_round_sharing=not args.no_current_round_sharing or None,
         )
     else:
         kv_config = KVCommConfig.from_env()

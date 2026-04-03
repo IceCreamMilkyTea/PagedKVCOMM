@@ -42,6 +42,7 @@ Architecture overview:
 
 from __future__ import annotations
 
+import random
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -319,30 +320,77 @@ class PagedKVCOMMEngine:
         base_prefix_num_tokens: int,
         max_anchor_num: int = 20,
         window_length: int = 5,
+        free_ratio_threshold: float = 0.15,
     ) -> None:
         """Store an anchor entry using block references + delta.
 
-        Steps:
-          1. Read base KV from blocks → store embedding for similarity computation
-          2. Read real KV from blocks → compute delta = real - base
-          3. Allocate new blocks for delta → write delta to blocks
-          4. Store block references (not tensors) in anchor entry
+        All KV reads, delta computation, and block allocation happen BEFORE
+        the lock so that evict_until_free (triggered by allocate_blocks_for_tokens
+        when the pool is full) cannot see this entry and self-evict it.
 
-        The base's block_table is shared (via ref counting) so multiple agents
-        referencing the same prefix share physical blocks → zero-copy.
+        The single final lock atomically: creates or retrieves the entry,
+        frees any stale delta blocks from a prior call for this (agent_id,
+        message) pair, and stores the new delta block references.
         """
-        # Read base KV for similarity (placeholder portion)
+        # ── 0. Proactive eviction (mirrors gpt_chat update_anchor) ───────────
+        # Check pool health before allocating delta blocks. Tries this ph_id
+        # first, then falls back globally — same order as gpt_chat's per-ph_id
+        # update_anchor + global fallback.
+        self.evict_proactive(
+            ph_id=ph_id,
+            free_ratio_threshold=free_ratio_threshold,
+            window_length=window_length,
+        )
+
+        # ── 1. All KV reads and delta computation (no lock needed) ──────────
         base_ph_key, base_ph_val = self.read_kv_from_blocks(base_block_table, base_num_tokens)
 
+        real_ph_key, real_ph_val = self.read_kv_from_blocks(real_block_table, real_num_tokens)
+        if real_ph_key.shape[2] != real_num_tokens or real_ph_key.shape[2] == 0:
+            raise ValueError(
+                f"set_anchor: real_ph_key has {real_ph_key.shape[2]} tokens at dim 2, "
+                f"expected {real_num_tokens}. real_block_table may be empty or misaligned."
+            )
+        ph_key_delta = real_ph_key - base_ph_key[..., :real_num_tokens, :]
+        ph_val_delta = real_ph_val - base_ph_val[..., :real_num_tokens, :]
+
+        # Prefix delta (absent when prefix token counts are zero)
+        pf_tokens = 0
+        pf_key_delta: Optional[torch.Tensor] = None
+        pf_val_delta: Optional[torch.Tensor] = None
+        if real_prefix_num_tokens > 0 and base_prefix_num_tokens > 0:
+            real_pf_key, real_pf_val = self.read_kv_from_blocks(
+                real_prefix_block_table, real_prefix_num_tokens
+            )
+            base_pf_key, base_pf_val = self.read_kv_from_blocks(
+                base_prefix_block_table, base_prefix_num_tokens
+            )
+            pf_tokens = min(
+                real_pf_key.shape[2], base_pf_key.shape[2],
+                real_prefix_num_tokens, base_prefix_num_tokens,
+            )
+            if pf_tokens > 0:
+                pf_key_delta = real_pf_key[..., :pf_tokens, :] - base_pf_key[..., :pf_tokens, :]
+                pf_val_delta = real_pf_val[..., :pf_tokens, :] - base_pf_val[..., :pf_tokens, :]
+
+        # ── 2. Block allocation and write (no lock, entry not in store yet) ──
+        # The entry is absent from ph_store until step 3, so evict_until_free
+        # triggered here cannot pick this message → no self-eviction.
+        ph_delta_blocks = self.allocate_blocks_for_tokens(real_num_tokens)
+        self.write_kv_to_blocks(ph_delta_blocks, ph_key_delta, ph_val_delta, real_num_tokens)
+
+        pf_delta_blocks: List[int] = []
+        if pf_tokens > 0 and pf_key_delta is not None:
+            pf_delta_blocks = self.allocate_blocks_for_tokens(pf_tokens)
+            self.write_kv_to_blocks(pf_delta_blocks, pf_key_delta, pf_val_delta, pf_tokens)
+
+        # ── 3. Single lock: create/update entry + store delta refs atomically ─
         with self._lock:
             ph_store = self.anchors.setdefault(ph_id, {})
 
             if message not in ph_store:
-                # Evict if over capacity
                 if len(ph_store) >= max_anchor_num:
                     self.evict_anchor(ph_id, window_length)
-
-                # New anchor: store base embedding + block reference
                 self.increment_ref(base_block_table)
                 entry = PagedAnchorEntry(
                     block_table=list(base_block_table),
@@ -355,40 +403,12 @@ class PagedKVCOMMEngine:
             else:
                 entry = ph_store[message]
 
-        # Compute placeholder delta: real - base
-        real_ph_key, real_ph_val = self.read_kv_from_blocks(real_block_table, real_num_tokens)
-        if real_ph_key.shape[2] != real_num_tokens or real_ph_key.shape[2] == 0:
-            raise ValueError(
-                f"set_anchor: real_ph_key has {real_ph_key.shape[2]} tokens at dim 2, "
-                f"expected {real_num_tokens}. real_block_table may be empty or misaligned."
-            )
-        ph_key_delta = real_ph_key - base_ph_key[..., :real_num_tokens, :]
-        ph_val_delta = real_ph_val - base_ph_val[..., :real_num_tokens, :]
+            # Free stale delta blocks before overwriting to prevent block leak.
+            old_delta = entry.agent_deltas.get(agent_id)
+            if old_delta is not None:
+                self.free_blocks(old_delta.get("ph_delta_blocks", []))
+                self.free_blocks(old_delta.get("pf_delta_blocks", []))
 
-        # Allocate blocks for placeholder delta and write
-        ph_delta_blocks = self.allocate_blocks_for_tokens(real_num_tokens)
-        self.write_kv_to_blocks(ph_delta_blocks, ph_key_delta, ph_val_delta, real_num_tokens)
-
-        # Compute prefix delta: real - base
-        if real_prefix_num_tokens <= 0 or base_prefix_num_tokens <= 0:
-            return
-        real_pf_key, real_pf_val = self.read_kv_from_blocks(
-            real_prefix_block_table, real_prefix_num_tokens
-        )
-        base_pf_key, base_pf_val = self.read_kv_from_blocks(
-            base_prefix_block_table, base_prefix_num_tokens
-        )
-        pf_tokens = min(real_pf_key.shape[2], base_pf_key.shape[2], real_prefix_num_tokens, base_prefix_num_tokens)
-        if pf_tokens <= 0:
-            return
-        pf_key_delta = real_pf_key[..., :pf_tokens, :] - base_pf_key[..., :pf_tokens, :]
-        pf_val_delta = real_pf_val[..., :pf_tokens, :] - base_pf_val[..., :pf_tokens, :]
-
-        pf_delta_blocks = self.allocate_blocks_for_tokens(pf_tokens)
-        self.write_kv_to_blocks(pf_delta_blocks, pf_key_delta, pf_val_delta, pf_tokens)
-
-        # Store delta block references for this agent
-        with self._lock:
             entry.agent_deltas[agent_id] = {
                 "ph_delta_blocks": ph_delta_blocks,
                 "ph_delta_num_tokens": real_num_tokens,
@@ -519,26 +539,30 @@ class PagedKVCOMMEngine:
         anchor_list: List[str],
         upstream_agent_id: str,
         temperature: float = 1.0,
+        local_ref_mode: str = "no_check",
+        consistency_threshold: float = 0.5,
+        weight_threshold: float = 0.3,
     ) -> Tuple[List[int], int, List[int], int]:
-        """Paged local-reference offset: use upstream agent's KV as reference.
+        """Paged local-reference offset: use cross-agent delta pattern from
+        historical anchors to improve the base-reference offset.
 
-        approx = upstream_KV + Σ(w_k × (delta_target_k − delta_upstream_k))
+        approx = base_KV + Σ(w_k × delta_target_k) + Σ(w_k × (delta_target_k − delta_upstream_k))
 
-        Falls back to base-reference offset when upstream data is unavailable.
+        The cross-agent correction captures the stable KV difference pattern
+        between agents across historical anchors and applies it to the current
+        kv_reuse query.
+
+        local_ref_mode controls the similarity gate:
+          - "no_check":  always apply cross-delta correction
+          - "cross_delta_consistency": apply only when cross-deltas across anchors
+                                      have low relative std (stable pattern)
+          - "weight_confidence": apply only when max softmax weight exceeds threshold
+
+        Falls back to base-reference offset when no valid anchors exist.
         """
         ph_store = self.anchors.get(ph_id, {})
 
-        # 1. Check upstream delta exists for the CURRENT message
-        current_entry = ph_store.get(message)
-        if current_entry is None or upstream_agent_id not in current_entry.agent_deltas:
-            return self.offset_kv_cache(
-                agent_id, ph_id, message,
-                base_ph_block_table, base_ph_num_tokens,
-                base_pf_block_table, base_pf_num_tokens,
-                anchor_list, temperature,
-            )
-
-        # 2. Collect anchors with BOTH target and upstream deltas
+        # 1. Collect anchors with BOTH target and upstream agent deltas
         valid_anchors = []
         for msg in anchor_list:
             entry = ph_store.get(msg)
@@ -557,6 +581,11 @@ class PagedKVCOMMEngine:
             valid_anchors.append((msg, entry))
 
         if not valid_anchors:
+            logger.info(
+                "[LOCAL_REF_FALLBACK] agent={} ph_id={} upstream={} reason=no_valid_anchors "
+                "anchor_list_len={} ph_store_keys={}",
+                agent_id, ph_id, upstream_agent_id, len(anchor_list), len(ph_store),
+            )
             return self.offset_kv_cache(
                 agent_id, ph_id, message,
                 base_ph_block_table, base_ph_num_tokens,
@@ -564,19 +593,12 @@ class PagedKVCOMMEngine:
                 anchor_list, temperature,
             )
 
-        # 3. Read base KV + upstream delta for CURRENT message → exact upstream KV
+        # 2. Read base KV
         base_ph_key, base_ph_val = self.read_kv_from_blocks(
             base_ph_block_table, base_ph_num_tokens
         )
 
-        up_cur_info = current_entry.agent_deltas[upstream_agent_id]
-        up_cur_dk, up_cur_dv = self.read_kv_from_blocks(
-            up_cur_info["ph_delta_blocks"], base_ph_num_tokens,
-        )
-        upstream_ph_key = base_ph_key + up_cur_dk[..., :base_ph_num_tokens, :]
-        upstream_ph_val = base_ph_val + up_cur_dv[..., :base_ph_num_tokens, :]
-
-        # 4. Compute similarity weights (same as base-ref path)
+        # 3. Compute similarity weights
         sims_list = []
         for _, entry in valid_anchors:
             anchor_key = entry.ph_key_embedding[..., -base_ph_num_tokens:, :]
@@ -586,9 +608,12 @@ class PagedKVCOMMEngine:
         sims = torch.stack(sims_list, dim=0)
         weights = torch.softmax(-sims.float() / temperature, dim=0).unsqueeze(-2)
 
-        # 5. Weighted sum of cross-deltas (placeholder)
-        cross_sum_k = torch.zeros_like(base_ph_key)
-        cross_sum_v = torch.zeros_like(base_ph_val)
+        # 4. Compute base-reference offset (target agent's own deltas)
+        ph_delta_sum_k = torch.zeros_like(base_ph_key)
+        ph_delta_sum_v = torch.zeros_like(base_ph_val)
+        # Also collect cross-deltas for the correction term
+        cross_deltas_k = []
+        cross_deltas_v = []
         for i, (msg, entry) in enumerate(valid_anchors):
             tgt_dk, tgt_dv = self.read_kv_from_blocks(
                 entry.agent_deltas[agent_id]["ph_delta_blocks"], base_ph_num_tokens,
@@ -596,20 +621,66 @@ class PagedKVCOMMEngine:
             up_dk, up_dv = self.read_kv_from_blocks(
                 entry.agent_deltas[upstream_agent_id]["ph_delta_blocks"], base_ph_num_tokens,
             )
+            tgt_dk = tgt_dk[..., :base_ph_num_tokens, :]
+            tgt_dv = tgt_dv[..., :base_ph_num_tokens, :]
+            up_dk = up_dk[..., :base_ph_num_tokens, :]
+            up_dv = up_dv[..., :base_ph_num_tokens, :]
             w = weights[i]
-            cross_sum_k += w * (tgt_dk[..., :base_ph_num_tokens, :] - up_dk[..., :base_ph_num_tokens, :])
-            cross_sum_v += w * (tgt_dv[..., :base_ph_num_tokens, :] - up_dv[..., :base_ph_num_tokens, :])
+            ph_delta_sum_k += w * tgt_dk
+            ph_delta_sum_v += w * tgt_dv
+            cross_deltas_k.append(tgt_dk - up_dk)
+            cross_deltas_v.append(tgt_dv - up_dv)
 
-        # 6. Apply: result = upstream_KV + cross_delta
-        new_ph_key = upstream_ph_key + cross_sum_k.to(upstream_ph_key.dtype)
-        new_ph_val = upstream_ph_val + cross_sum_v.to(upstream_ph_val.dtype)
+        # 5. Similarity gate: decide whether to apply cross-delta correction
+        apply_cross_delta = True
+        gate_info = ""
+
+        if local_ref_mode == "cross_delta_consistency":
+            # Check if cross-deltas are consistent across anchors (low variance → stable pattern)
+            if len(cross_deltas_k) >= 2:
+                stacked = torch.stack(cross_deltas_k, dim=0)  # [N, layers, heads, tokens, dim]
+                mean_norm = stacked.float().mean(dim=0).norm(2, dim=-1).mean()
+                std_norm = stacked.float().std(dim=0).norm(2, dim=-1).mean()
+                relative_std = (std_norm / (mean_norm + 1e-8)).item()
+                apply_cross_delta = relative_std < consistency_threshold
+                gate_info = f"consistency relative_std={relative_std:.4f} threshold={consistency_threshold}"
+            else:
+                # Only 1 anchor: can't measure consistency, apply anyway
+                gate_info = "consistency skip (single_anchor)"
+
+        elif local_ref_mode == "weight_confidence":
+            # Check if the best anchor weight is confident enough
+            max_weight = weights.max().item()
+            apply_cross_delta = max_weight > weight_threshold
+            gate_info = f"weight_confidence max_weight={max_weight:.4f} threshold={weight_threshold}"
+
+        else:
+            gate_info = "no_check"
+
+        if apply_cross_delta:
+            # 6. Compute weighted cross-delta correction
+            cross_sum_k = torch.zeros_like(base_ph_key)
+            cross_sum_v = torch.zeros_like(base_ph_val)
+            for i in range(len(valid_anchors)):
+                w = weights[i]
+                cross_sum_k += w * cross_deltas_k[i]
+                cross_sum_v += w * cross_deltas_v[i]
+
+            # 7. Apply: base + target_delta + cross_delta_correction
+            new_ph_key = base_ph_key + ph_delta_sum_k.to(base_ph_key.dtype) + cross_sum_k.to(base_ph_key.dtype)
+            new_ph_val = base_ph_val + ph_delta_sum_v.to(base_ph_val.dtype) + cross_sum_v.to(base_ph_val.dtype)
+        else:
+            # Gate rejected: use base-reference offset only (no cross-delta)
+            new_ph_key = base_ph_key + ph_delta_sum_k.to(base_ph_key.dtype)
+            new_ph_val = base_ph_val + ph_delta_sum_v.to(base_ph_val.dtype)
+
         new_ph_key[0] = base_ph_key[0]
         new_ph_val[0] = base_ph_val[0]
 
         new_ph_blocks = self.allocate_blocks_for_tokens(base_ph_num_tokens)
         self.write_kv_to_blocks(new_ph_blocks, new_ph_key, new_ph_val, base_ph_num_tokens)
 
-        # 7. Prefix: cross-delta or fallback
+        # 8. Prefix: same logic
         base_pf_key, base_pf_val = self.read_kv_from_blocks(
             base_pf_block_table, base_pf_num_tokens
         )
@@ -620,18 +691,10 @@ class PagedKVCOMMEngine:
             and int(entry.agent_deltas[agent_id].get("pf_delta_num_tokens", 0) or 0) >= base_pf_num_tokens
             for _, entry in valid_anchors
         )
-        up_cur_has_pf = (
-            base_pf_num_tokens > 0
-            and int(up_cur_info.get("pf_delta_num_tokens", 0) or 0) >= base_pf_num_tokens
-        )
 
-        if has_pf and up_cur_has_pf:
-            up_pf_dk, up_pf_dv = self.read_kv_from_blocks(
-                up_cur_info["pf_delta_blocks"], base_pf_num_tokens,
-            )
-            upstream_pf_key = base_pf_key + up_pf_dk[..., :base_pf_num_tokens, :]
-            upstream_pf_val = base_pf_val + up_pf_dv[..., :base_pf_num_tokens, :]
-
+        if has_pf and apply_cross_delta:
+            pf_delta_k = torch.zeros_like(base_pf_key)
+            pf_delta_v = torch.zeros_like(base_pf_val)
             pf_cross_k = torch.zeros_like(base_pf_key)
             pf_cross_v = torch.zeros_like(base_pf_val)
             for i, (msg, entry) in enumerate(valid_anchors):
@@ -642,13 +705,14 @@ class PagedKVCOMMEngine:
                     entry.agent_deltas[upstream_agent_id]["pf_delta_blocks"], base_pf_num_tokens,
                 )
                 w = weights[i]
+                pf_delta_k += w * tgt_dk
+                pf_delta_v += w * tgt_dv
                 pf_cross_k += w * (tgt_dk - up_dk)
                 pf_cross_v += w * (tgt_dv - up_dv)
-
-            new_pf_key = upstream_pf_key + pf_cross_k.to(upstream_pf_key.dtype)
-            new_pf_val = upstream_pf_val + pf_cross_v.to(upstream_pf_val.dtype)
+            new_pf_key = base_pf_key + pf_delta_k.to(base_pf_key.dtype) + pf_cross_k.to(base_pf_key.dtype)
+            new_pf_val = base_pf_val + pf_delta_v.to(base_pf_val.dtype) + pf_cross_v.to(base_pf_val.dtype)
         else:
-            # Prefix fallback: base-reference
+            # Prefix: base-reference only
             pf_delta_k = torch.zeros_like(base_pf_key)
             pf_delta_v = torch.zeros_like(base_pf_val)
             for i, (msg, entry) in enumerate(valid_anchors):
@@ -667,10 +731,12 @@ class PagedKVCOMMEngine:
         new_pf_blocks = self.allocate_blocks_for_tokens(base_pf_num_tokens)
         self.write_kv_to_blocks(new_pf_blocks, new_pf_key, new_pf_val, base_pf_num_tokens)
 
-        logger.opt(colors=True).info(
-            f"<green>[LOCAL_REF:paged] APPLIED | agent={agent_id} ph_id={ph_id} | "
-            f"upstream={upstream_agent_id} | anchors_used={len(valid_anchors)} | "
-            f"ph_tokens={base_ph_num_tokens}</green>"
+        logger.info(
+            "[LOCAL_REF:paged] {} | agent={} ph_id={} upstream={} "
+            "valid_anchors={} apply_cross_delta={} gate={} ph_tokens={}",
+            "APPLIED" if apply_cross_delta else "GATE_REJECTED",
+            agent_id, ph_id, upstream_agent_id,
+            len(valid_anchors), apply_cross_delta, gate_info, base_ph_num_tokens,
         )
 
         return new_ph_blocks, base_ph_num_tokens, new_pf_blocks, base_pf_num_tokens
@@ -820,9 +886,13 @@ class PagedKVCOMMEngine:
     def evict_anchor(self, ph_id: str, window_length: int = 5) -> bool:
         """Evict the least-activated anchor within a window for a given ph_id.
 
-        Mirrors KVCOMMEngine.update_anchor(): looks at the oldest `window_length`
+        Mirrors KVCOMMEngine.update_anchor(): looks at the oldest `effective_window`
         anchors (by insertion order) and removes the one with the lowest
         activation count, freeing its blocks back to the pool.
+
+        The effective window is sampled uniformly from [5, 8] each call to
+        introduce randomness in eviction candidate selection, which avoids
+        repeatedly evicting from the same fixed prefix of the anchor pool.
 
         Returns True if an anchor was evicted, False otherwise.
         """
@@ -831,8 +901,9 @@ class PagedKVCOMMEngine:
             return False
 
         info_store = self.anchor_info.get(ph_id, {})
-        # Look at the oldest window_length anchors (dict preserves insertion order)
-        messages = list(ph_store.keys())[:window_length]
+        # Randomly choose effective window size in [5, 8] for varied eviction
+        effective_window = random.randint(5, 8)
+        messages = list(ph_store.keys())[:effective_window]
         if not messages:
             return False
 
@@ -847,8 +918,8 @@ class PagedKVCOMMEngine:
 
         logger.info(
             "[ANCHOR_EVICT:paged] ph_id={} evicted_message={} activation_count={} "
-            "remaining_anchors={}",
-            ph_id, min_msg[:80], min_count, len(ph_store) - 1,
+            "effective_window={} remaining_anchors={}",
+            ph_id, min_msg[:80], min_count, effective_window, len(ph_store) - 1,
         )
         self.free_anchor(ph_id, min_msg)
         return True
@@ -872,6 +943,53 @@ class PagedKVCOMMEngine:
             if not evicted:
                 return False
         return True
+
+    def evict_proactive(
+        self,
+        ph_id: Optional[str] = None,
+        free_ratio_threshold: float = 0.15,
+        window_length: int = 5,
+    ) -> int:
+        """Proactively evict anchors when the free pool fraction falls below threshold.
+
+        Mirrors gpt_chat's update_anchor: tries the given ph_id first (same as
+        the anchor being written), then falls back to the ph_id with the most
+        anchors globally — so the pool is kept healthy before delta blocks are
+        allocated, not only after it is completely exhausted.
+
+        Returns the number of anchors evicted.
+        """
+        total = len(self.block_manager.blocks)
+        if total == 0:
+            return 0
+        evicted = 0
+        while len(self.block_manager.free_block_ids) / total < free_ratio_threshold:
+            # 1. Same ph_id first (aligned with gpt_chat update_anchor)
+            if ph_id and self.anchors.get(ph_id):
+                if self.evict_anchor(ph_id, window_length):
+                    evicted += 1
+                    continue
+            # 2. Global fallback: ph_id with the most anchors
+            best_ph_id = None
+            best_count = 0
+            for pid, ph_store in self.anchors.items():
+                if len(ph_store) > best_count:
+                    best_count = len(ph_store)
+                    best_ph_id = pid
+            if best_ph_id is not None and self.evict_anchor(best_ph_id, window_length):
+                evicted += 1
+            else:
+                break  # nothing left to evict
+        if evicted > 0:
+            logger.info(
+                "[PROACTIVE_EVICT] ph_id={} evicted={} free_blocks={} total_blocks={} free_ratio={:.3f}",
+                ph_id,
+                evicted,
+                len(self.block_manager.free_block_ids),
+                total,
+                len(self.block_manager.free_block_ids) / total,
+            )
+        return evicted
 
     def get_memory_stats(self) -> Dict[str, int]:
         """Return memory usage statistics."""
