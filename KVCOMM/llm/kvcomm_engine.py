@@ -1496,9 +1496,14 @@ class KVCOMMEngine:
         if crs_on and m["ph_id"] == "user_question":
             upstream_id = self._find_upstream_agent(request_uid, m["ph_id"], message)
             if upstream_id is not None:
+                ph_before_crs, pf_before_crs = new_ph, new_pf
                 new_ph, new_pf = self._apply_crs_offset(
                     m["ph_id"], message, request_uid,
                     new_ph, new_pf, anchors_for_ph, upstream_id,
+                )
+                self._write_crs_delta_to_anchor(
+                    request_uid, m["ph_id"], message,
+                    ph_before_crs, pf_before_crs, new_ph, new_pf,
                 )
                 seg_cache = new_ph.concat_([new_pf])
                 seg_token_ids = concat(self.trim_token_ids(m["ph_cache_ids"], m["drop_num"]), m["pf_ids"])
@@ -1640,6 +1645,49 @@ class KVCOMMEngine:
         except Exception as exc:
             logger.warning("[CRS:hf] error: {}; falling back to base cache", exc)
             return base_placeholder_cache, base_prefix_cache
+
+    def _write_crs_delta_to_anchor(
+        self,
+        request_uid: str,
+        ph_id: str,
+        message: str,
+        base_ph: "DynamicCache",
+        base_pf: "DynamicCache",
+        new_ph: "DynamicCache",
+        new_pf: "DynamicCache",
+    ) -> None:
+        """Store this node's approximate CRS delta into the existing anchor entry.
+
+        When CRS bypass skips dense_prefill, the node never writes its own delta.
+        Future rounds that fall into offset_kv_cache_pair (no upstream available)
+        would KeyError on the missing delta.  Writing the CRS-derived delta here
+        makes every anchor entry self-consistent for all participating nodes.
+
+        ph delta = new_ph - base_ph  (the CRS correction)
+        pf delta = new_pf - base_pf  (zero, since CRS does not touch the prefix)
+        """
+        node_id = self.llm.node_id
+        pf_key = f"{node_id}_pf_key_delta"
+        state = self.resolve_request_state(request_uid)
+        entry = state.anchors.get(ph_id, {}).get(message)
+        if entry is None or pf_key in entry:
+            # No anchor to update, or self delta already written by dense_prefill
+            return
+        try:
+            ph_base_k, ph_base_v = self._stack_cache_tensors(base_ph)
+            ph_new_k, ph_new_v = self._stack_cache_tensors(new_ph)
+            pf_base_k, pf_base_v = self._stack_cache_tensors(base_pf)
+            pf_new_k, pf_new_v = self._stack_cache_tensors(new_pf)
+            entry[f"{node_id}_ph_key_delta"] = ph_new_k - ph_base_k
+            entry[f"{node_id}_ph_value_delta"] = ph_new_v - ph_base_v
+            entry[f"{node_id}_pf_key_delta"] = pf_new_k - pf_base_k
+            entry[f"{node_id}_pf_value_delta"] = pf_new_v - pf_base_v
+            logger.info(
+                "[CRS:hf] wrote CRS delta to anchor | node={} ph_id={} message={}",
+                node_id, ph_id, message[:40],
+            )
+        except Exception as exc:
+            logger.warning("[CRS:hf] failed to write CRS delta to anchor: {}", exc)
 
     def process_anchor(
         self,

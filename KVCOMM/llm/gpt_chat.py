@@ -1090,8 +1090,7 @@ class LLMChat(LLM):
             if LLMChat._shared_model is None:
                 LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
                 if LLMChat._use_flash_attention:
-                    # Flash Attention 2 requires float16 or bfloat16
-                    model_dtype = torch.bfloat16
+                    model_dtype = torch.float16
                 elif 'llama' in self.model_name:
                     model_dtype = torch.float16
                 else:

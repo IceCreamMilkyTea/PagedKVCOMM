@@ -141,6 +141,13 @@ class PagedKVCOMMEngine:
         self.anchor_info: Dict[str, Dict[str, int]] = {}
         self._lock = threading.Lock()
 
+        # Response embedding store (separate from placeholder anchors).
+        # Stores actual response token value KVs for response anchor prediction.
+        # ph_id → message → value tensor [num_layers, num_kv_heads, num_tokens, head_dim] on CPU
+        self.response_embeddings: Dict[str, Dict[str, torch.Tensor]] = {}
+        # ph_id → message → num_tokens (actual response length)
+        self.response_token_counts: Dict[str, Dict[str, int]] = {}
+
     # ─────────────────────── Block-level KV read/write ───────────────────────
 
     def read_kv_from_blocks(
@@ -741,6 +748,36 @@ class PagedKVCOMMEngine:
 
         return new_ph_blocks, base_ph_num_tokens, new_pf_blocks, base_pf_num_tokens
 
+    # ── Response embedding store ──────────────────────────────────────────────
+
+    def store_response_embedding(
+        self,
+        ph_id: str,
+        message: str,
+        block_table: List[int],
+        num_tokens: int,
+        max_entries: int = 20,
+    ) -> None:
+        """Store actual response value KV for later response anchor prediction.
+
+        This is separate from placeholder PagedAnchorEntry because:
+        - entry.num_tokens = template placeholder size (e.g. 64 tokens)
+        - actual response length varies (e.g. 150 tokens)
+        Mixing them causes the length check in predict_as_anchor to always fail.
+        """
+        if num_tokens <= 0 or not block_table:
+            return
+        _, val = self.read_kv_from_blocks(block_table, num_tokens)
+        emb_store = self.response_embeddings.setdefault(ph_id, {})
+        cnt_store = self.response_token_counts.setdefault(ph_id, {})
+        # Simple FIFO eviction when over capacity
+        if len(emb_store) >= max_entries and message not in emb_store:
+            oldest = next(iter(emb_store))
+            del emb_store[oldest]
+            del cnt_store[oldest]
+        emb_store[message] = val.detach().cpu()
+        cnt_store[message] = num_tokens
+
     def predict_as_anchor(
         self,
         ph_id: str,
@@ -750,10 +787,19 @@ class PagedKVCOMMEngine:
         top_p: float = 0.9,
         entropy_threshold: float = 0.5,
         max_compare_anchors: int = 64,
+        use_response_embeddings: bool = False,
     ) -> Tuple[bool, List[int]]:
         """Decide whether to activate anchors based on KV similarity.
 
         Same logic as KVCOMMEngine.predict_as_anchor() but reads from blocks.
+
+        Args:
+            use_response_embeddings: When True, compare against stored response
+                value embeddings (response_embeddings[ph_id]) instead of
+                placeholder anchor entries (anchors[ph_id]).
+                Must be True for response anchor prediction to avoid comparing
+                template placeholder KV (64 tokens) against actual response KV
+                (150+ tokens), which always fails the length check.
 
         Returns:
             (prob, activated_counts)
@@ -762,53 +808,98 @@ class PagedKVCOMMEngine:
             - prob == True  => treat as new anchor (dense_prefill path)
             - prob == False => reuse existing anchors (kv_reuse path)
         """
-        ph_store = self.anchors.get(ph_id, {})
         activated = [0] * len(anchor_messages)
 
-        available_indices = []
-        available_entries = []
-        for i, msg in enumerate(anchor_messages):
-            entry = ph_store.get(msg)
-            if entry is not None and entry.num_tokens >= candidate_num_tokens:
-                available_indices.append(i)
-                available_entries.append(entry)
+        if use_response_embeddings:
+            # Response anchor path: compare actual response KV vs stored response KVs.
+            emb_store = self.response_embeddings.get(ph_id, {})
+            cnt_store = self.response_token_counts.get(ph_id, {})
 
-        # Compare only a bounded recent subset to keep predict path memory stable.
-        if max_compare_anchors > 0 and len(available_entries) > max_compare_anchors:
-            available_indices = available_indices[-max_compare_anchors:]
-            available_entries = available_entries[-max_compare_anchors:]
+            available_indices = []
+            available_vals = []
+            for i, msg in enumerate(anchor_messages):
+                stored_val = emb_store.get(msg)
+                stored_cnt = cnt_store.get(msg, 0)
+                if stored_val is not None and stored_cnt >= candidate_num_tokens:
+                    available_indices.append(i)
+                    available_vals.append(stored_val)
 
-        if len(anchor_messages) == 0:
-            reason = "no_anchor_history"
-        elif len(available_entries) == 0:
-            reason = "no_length_eligible_anchor"
-        elif len(available_entries) == 1:
-            reason = "single_length_eligible_anchor"
+            if max_compare_anchors > 0 and len(available_vals) > max_compare_anchors:
+                available_indices = available_indices[-max_compare_anchors:]
+                available_vals = available_vals[-max_compare_anchors:]
+
+            if len(anchor_messages) == 0:
+                reason = "no_anchor_history"
+            elif len(available_vals) == 0:
+                reason = "no_length_eligible_anchor"
+            elif len(available_vals) == 1:
+                reason = "single_length_eligible_anchor"
+            else:
+                reason = "insufficient_anchors"
+
+            if len(available_vals) <= 1:
+                logger.info(
+                    "[ANCHOR_PREDICT:paged] ph_id={} anchor_messages={} available_entries={} "
+                    "candidate_num_tokens={} decision=dense_prefill reason={} mode=response",
+                    ph_id, len(anchor_messages), len(available_vals),
+                    candidate_num_tokens, reason,
+                )
+                return True, activated
+
+            _, cand_val = self.read_kv_from_blocks(candidate_block_table, candidate_num_tokens)
+
+            diff_list = []
+            for stored_val in available_vals:
+                anchor_val = stored_val[..., :candidate_num_tokens, :]
+                if anchor_val.device != cand_val.device:
+                    anchor_val = anchor_val.to(cand_val.device, non_blocking=True)
+                diff_list.append((cand_val - anchor_val).norm(2, dim=(0, 1, 2, 3)))
+
         else:
-            reason = "insufficient_anchors"
+            # Placeholder anchor path (original logic).
+            ph_store = self.anchors.get(ph_id, {})
 
-        if len(available_entries) <= 1:
-            logger.info(
-                "[ANCHOR_PREDICT:paged] ph_id={} anchor_messages={} available_entries={} "
-                "candidate_num_tokens={} decision=dense_prefill reason={}",
-                ph_id,
-                len(anchor_messages),
-                len(available_entries),
-                candidate_num_tokens,
-                reason,
-            )
-            return True, activated
+            available_indices = []
+            available_entries = []
+            for i, msg in enumerate(anchor_messages):
+                entry = ph_store.get(msg)
+                if entry is not None and entry.num_tokens >= candidate_num_tokens:
+                    available_indices.append(i)
+                    available_entries.append(entry)
 
-        # Read candidate KV
-        _, cand_val = self.read_kv_from_blocks(candidate_block_table, candidate_num_tokens)
+            if max_compare_anchors > 0 and len(available_entries) > max_compare_anchors:
+                available_indices = available_indices[-max_compare_anchors:]
+                available_entries = available_entries[-max_compare_anchors:]
 
-        # Stream anchor distance computation to avoid large temporary tensors.
-        diff_list = []
-        for entry in available_entries:
-            anchor_val = entry.ph_value_embedding[..., :candidate_num_tokens, :]
-            if anchor_val.device != cand_val.device:
-                anchor_val = anchor_val.to(cand_val.device, non_blocking=True)
-            diff_list.append((cand_val - anchor_val).norm(2, dim=(0, 1, 2, 3)))
+            if len(anchor_messages) == 0:
+                reason = "no_anchor_history"
+            elif len(available_entries) == 0:
+                reason = "no_length_eligible_anchor"
+            elif len(available_entries) == 1:
+                reason = "single_length_eligible_anchor"
+            else:
+                reason = "insufficient_anchors"
+
+            if len(available_entries) <= 1:
+                logger.info(
+                    "[ANCHOR_PREDICT:paged] ph_id={} anchor_messages={} available_entries={} "
+                    "candidate_num_tokens={} decision=dense_prefill reason={}",
+                    ph_id, len(anchor_messages), len(available_entries),
+                    candidate_num_tokens, reason,
+                )
+                return True, activated
+
+            _, cand_val = self.read_kv_from_blocks(candidate_block_table, candidate_num_tokens)
+
+            diff_list = []
+            for entry in available_entries:
+                anchor_val = entry.ph_value_embedding[..., :candidate_num_tokens, :]
+                if anchor_val.device != cand_val.device:
+                    anchor_val = anchor_val.to(cand_val.device, non_blocking=True)
+                diff_list.append((cand_val - anchor_val).norm(2, dim=(0, 1, 2, 3)))
+
+            available_vals = available_entries  # alias for unified code below
+
         diff = torch.stack(diff_list, dim=0)
         sim = torch.softmax(-diff.float(), dim=0)
 
@@ -819,12 +910,8 @@ class PagedKVCOMMEngine:
             logger.info(
                 "[ANCHOR_PREDICT:paged] ph_id={} anchor_messages={} available_entries={} "
                 "candidate_num_tokens={} entropy={} threshold={} decision=dense_prefill reason=high_entropy",
-                ph_id,
-                len(anchor_messages),
-                len(available_entries),
-                candidate_num_tokens,
-                float(entropy.item()),
-                float(threshold.item()),
+                ph_id, len(anchor_messages), len(available_vals),
+                candidate_num_tokens, float(entropy.item()), float(threshold.item()),
             )
             return True, activated
 
@@ -843,11 +930,8 @@ class PagedKVCOMMEngine:
         logger.info(
             "[ANCHOR_PREDICT:paged] ph_id={} anchor_messages={} available_entries={} "
             "candidate_num_tokens={} selected={} decision=kv_reuse",
-            ph_id,
-            len(anchor_messages),
-            len(available_entries),
-            candidate_num_tokens,
-            int(len(selected)),
+            ph_id, len(anchor_messages), len(available_vals),
+            candidate_num_tokens, int(len(selected)),
         )
         return False, activated
 

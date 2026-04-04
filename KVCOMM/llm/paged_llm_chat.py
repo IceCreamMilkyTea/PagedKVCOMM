@@ -145,7 +145,7 @@ class PagedLLMChat(LLM):
             if PagedLLMChat._shared_engine is None:
                 logger.info("Initializing nano-vllm engine for model: {}", self.model_name)
 
-                PagedLLMChat._shared_engine = LLMEngine(self.model_name)
+                PagedLLMChat._shared_engine = LLMEngine(self.model_name, dtype=torch.float16)
                 PagedLLMChat._shared_tokenizer = PagedLLMChat._shared_engine.tokenizer
 
                 # Extract KV cache and block manager from model_runner
@@ -625,6 +625,37 @@ class PagedLLMChat(LLM):
                                     getattr(self, "node_id", "?"),
                                     ph_id, up_id, ph_num, len(hist),
                                 )
+                                # Store this node's CRS-derived delta so future
+                                # offset_kv_cache rounds can use it (avoids silently
+                                # skipping this anchor due to missing agent_deltas entry).
+                                # ph delta = new_k - base_k; pf delta = 0 (CRS doesn't touch prefix).
+                                try:
+                                    ph_delta_k = (new_k - base_k).contiguous()
+                                    ph_delta_v = (new_v - base_v).contiguous()
+                                    delta_blocks = self.paged_kv_engine.allocate_blocks_for_tokens(ph_num)
+                                    self.paged_kv_engine.write_kv_to_blocks(
+                                        delta_blocks, ph_delta_k, ph_delta_v, ph_num
+                                    )
+                                    with self.paged_kv_engine._lock:
+                                        old = cur_entry.agent_deltas.get(self.node_id)
+                                        if old is not None:
+                                            self.paged_kv_engine.free_blocks(old.get("ph_delta_blocks", []))
+                                            self.paged_kv_engine.free_blocks(old.get("pf_delta_blocks", []))
+                                        cur_entry.agent_deltas[self.node_id] = {
+                                            "ph_delta_blocks": delta_blocks,
+                                            "ph_delta_num_tokens": ph_num,
+                                            "pf_delta_blocks": [],
+                                            "pf_delta_num_tokens": 0,
+                                        }
+                                    logger.info(
+                                        "[CUR_ROUND_SHARE:paged] wrote CRS delta | node={} ph_id={}",
+                                        getattr(self, "node_id", "?"), ph_id,
+                                    )
+                                except Exception as delta_exc:
+                                    logger.warning(
+                                        "[CUR_ROUND_SHARE:paged] failed to write CRS delta: {}",
+                                        delta_exc,
+                                    )
                             except Exception as exc:
                                 logger.warning(
                                     "[CUR_ROUND_SHARE:paged] ph_id={} error: {}; trying KVCOMM",
@@ -1303,13 +1334,24 @@ class PagedLLMChat(LLM):
 
             # ── Response anchor prediction (mirrors HF gpt_chat.py logic) ──
             response_anchor_key = f"agent_{self.node_id}_current"
-            resp_anchor_messages = list(
-                self.paged_kv_engine.anchors.get(response_anchor_key, {}).keys()
-            )
             resp_info_bucket = PagedLLMChat._anchor_info_dict.setdefault(response_anchor_key, {})
             resp_global_bucket = PagedLLMChat._global_anchor_info_dict.setdefault(response_anchor_key, {})
 
             if response_block_table and response_num_tokens > 0:
+                # Store actual response value KV before prediction so this round's
+                # embedding is available for future comparisons (same as HF path
+                # which appends response_kv_cache before calling predict_as_anchor).
+                self.paged_kv_engine.store_response_embedding(
+                    ph_id=response_anchor_key,
+                    message=message_key,
+                    block_table=response_block_table,
+                    num_tokens=response_num_tokens,
+                    max_entries=self.config.max_anchor_num,
+                )
+                # Use response_embeddings for anchor messages (not placeholder anchors).
+                resp_anchor_messages = list(
+                    self.paged_kv_engine.response_embeddings.get(response_anchor_key, {}).keys()
+                )
                 resp_prob, resp_activated = self.paged_kv_engine.predict_as_anchor(
                     ph_id=response_anchor_key,
                     candidate_block_table=response_block_table,
@@ -1318,8 +1360,10 @@ class PagedLLMChat(LLM):
                     top_p=0.9,
                     entropy_threshold=self.config.threshold,
                     max_compare_anchors=self.config.max_anchor_num,
+                    use_response_embeddings=True,
                 )
             else:
+                resp_anchor_messages = []
                 resp_prob, resp_activated = True, []
 
             safe_msg = _escape_loguru_markup(message)

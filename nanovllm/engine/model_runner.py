@@ -1,5 +1,6 @@
 import os
 import pickle
+import socket
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -34,7 +35,14 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
-        nccl_port = int(os.environ.get("NANOVLLM_NCCL_PORT", "2333"))
+        nccl_port_env = os.environ.get("NANOVLLM_NCCL_PORT")
+        if nccl_port_env:
+            nccl_port = int(nccl_port_env)
+        else:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+                _s.bind(("", 0))
+                _s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                nccl_port = _s.getsockname()[1]
         dist.init_process_group("nccl", f"tcp://localhost:{nccl_port}", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()

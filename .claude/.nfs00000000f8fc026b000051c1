@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3:*)",
+      "Bash(ls -la /home/users/yw641/workspace/mlsys/PagedKVCOMM/slurm-108617*.out)",
+      "Bash(squeue -u yw641)",
+      "Bash(sacct -j 10861745 --format=JobID,JobName,State,Start,End,Elapsed)",
+      "Bash(sacct -j 10861748 --format=JobID,JobName,State,Start,End,Elapsed)"
+    ]
+  }
+}
