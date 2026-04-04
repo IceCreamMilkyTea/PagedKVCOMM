@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(chmod +x /home/users/yw641/workspace/mlsys/PagedKVCOMM/scripts/run_paged_kvcomm_gsm8k.sh)",
+      "Read(//home/users/yw641/workspace/mlsys/PagedKVCOMM/**)",
+      "Bash(ls /home/users/yw641/workspace/mlsys/PagedKVCOMM/logs/paged_kvcomm*)"
+    ]
+  }
+}

@@ -138,7 +138,7 @@ async def main():
             local_ref_mode=args.local_ref_mode,
             local_ref_consistency_threshold=args.local_ref_consistency_threshold,
             local_ref_weight_threshold=args.local_ref_weight_threshold,
-            use_current_round_sharing=not args.no_current_round_sharing or None,
+            use_current_round_sharing=not args.no_current_round_sharing,
         )
     else:
         kv_config = KVCommConfig.from_env()

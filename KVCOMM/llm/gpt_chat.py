@@ -805,6 +805,24 @@ class LLMChat(LLM):
                             f"<green>The message has repeatedly received for message '{safe_message}' at placeholder '{safe_ph_id}'. So we will reuse the KV cache.</green>"
                         )
                         return "kv_reuse"
+                    # CRS bypass: if an upstream agent already has a delta for this
+                    # placeholder in the current round, kv_reuse + CRS offset is
+                    # sufficient — no need to force dense_prefill.
+                    crs_on = getattr(getattr(self, "config", None), "use_current_round_sharing", True)
+                    if crs_on and ph_id == "user_question":
+                        anchor_entry = state.anchors.get(ph_id, {}).get(message, {})
+                        has_upstream = any(
+                            k.endswith("_ph_key_delta") and not k.startswith(f"{self.node_id}_")
+                            for k in anchor_entry
+                        )
+                        if has_upstream:
+                            logger.info(
+                                "[UPDATE_INPUT_ANCHOR:hf] node={} ph_id={} "
+                                "has_upstream_delta=True -> allow kv_reuse (current-round sharing)",
+                                getattr(self, "node_id", "?"),
+                                ph_id,
+                            )
+                            continue  # don't force dense_prefill; check remaining ph_ids
                     logger.opt(colors=True).debug(
                         f"<yellow>Existing Anchor for message '{safe_message}' at placeholder '{safe_ph_id}'.</yellow>"
                     )
