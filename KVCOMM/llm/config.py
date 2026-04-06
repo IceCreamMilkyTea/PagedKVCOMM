@@ -26,6 +26,7 @@ class KVCommConfig:
     local_ref_weight_threshold: float = 0.3  # min max-weight for weight confidence
     proactive_evict_threshold: float = 0.15  # evict anchors when free pool fraction falls below this
     use_current_round_sharing: bool = True   # use upstream agent's current-round delta for user_question
+    crs_priority: bool = False               # bypass dense_prefill for user_question anchors even without own delta (ablation)
 
     @classmethod
     def from_env(cls) -> "KVCommConfig":
@@ -42,6 +43,7 @@ class KVCommConfig:
             local_ref_weight_threshold=float(os.environ.get("KVCOMM_LOCAL_REF_WEIGHT", cls.local_ref_weight_threshold)),
             proactive_evict_threshold=float(os.environ.get("KVCOMM_PROACTIVE_EVICT", cls.proactive_evict_threshold)),
             use_current_round_sharing=os.environ.get("KVCOMM_CURRENT_ROUND_SHARING", "1") == "1",
+            crs_priority=os.environ.get("KVCOMM_CRS_PRIORITY", "0") == "1",
         ).validate()
 
     def apply_overrides(self, **overrides: Any) -> "KVCommConfig":

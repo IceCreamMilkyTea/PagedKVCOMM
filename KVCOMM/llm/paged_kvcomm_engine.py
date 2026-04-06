@@ -328,6 +328,7 @@ class PagedKVCOMMEngine:
         max_anchor_num: int = 20,
         window_length: int = 5,
         free_ratio_threshold: float = 0.15,
+        ph_start_intra: int = 0,
     ) -> None:
         """Store an anchor entry using block references + delta.
 
@@ -350,9 +351,24 @@ class PagedKVCOMMEngine:
         )
 
         # ── 1. All KV reads and delta computation (no lock needed) ──────────
-        base_ph_key, base_ph_val = self.read_kv_from_blocks(base_block_table, base_num_tokens)
+        # When ph_start_intra > 0 the placeholder does not start at position 0
+        # of its first block (it shares that block with prefix tokens).  Read
+        # enough tokens to reach the placeholder, then slice it out.
+        if ph_start_intra > 0:
+            _base_full_k, _base_full_v = self.read_kv_from_blocks(
+                base_block_table, ph_start_intra + base_num_tokens
+            )
+            base_ph_key = _base_full_k[..., ph_start_intra:ph_start_intra + base_num_tokens, :]
+            base_ph_val = _base_full_v[..., ph_start_intra:ph_start_intra + base_num_tokens, :]
+            _real_full_k, _real_full_v = self.read_kv_from_blocks(
+                real_block_table, ph_start_intra + real_num_tokens
+            )
+            real_ph_key = _real_full_k[..., ph_start_intra:ph_start_intra + real_num_tokens, :]
+            real_ph_val = _real_full_v[..., ph_start_intra:ph_start_intra + real_num_tokens, :]
+        else:
+            base_ph_key, base_ph_val = self.read_kv_from_blocks(base_block_table, base_num_tokens)
+            real_ph_key, real_ph_val = self.read_kv_from_blocks(real_block_table, real_num_tokens)
 
-        real_ph_key, real_ph_val = self.read_kv_from_blocks(real_block_table, real_num_tokens)
         if real_ph_key.shape[2] != real_num_tokens or real_ph_key.shape[2] == 0:
             raise ValueError(
                 f"set_anchor: real_ph_key has {real_ph_key.shape[2]} tokens at dim 2, "
@@ -434,6 +450,7 @@ class PagedKVCOMMEngine:
         base_pf_num_tokens: int,
         anchor_list: List[str],
         temperature: float = 1.0,
+        ph_start_intra: int = 0,
     ) -> Tuple[List[int], int, List[int], int]:
         """Apply weighted anchor deltas to base KV and write result to new blocks.
 
@@ -473,8 +490,16 @@ class PagedKVCOMMEngine:
             self.increment_ref(base_pf_block_table)
             return base_ph_block_table, base_ph_num_tokens, base_pf_block_table, base_pf_num_tokens
 
-        # Read base KV
-        base_ph_key, base_ph_val = self.read_kv_from_blocks(base_ph_block_table, base_ph_num_tokens)
+        # Read base KV, accounting for intra-block offset when placeholder does
+        # not start at position 0 of its first block.
+        if ph_start_intra > 0:
+            _base_ph_full_k, _base_ph_full_v = self.read_kv_from_blocks(
+                base_ph_block_table, ph_start_intra + base_ph_num_tokens
+            )
+            base_ph_key = _base_ph_full_k[..., ph_start_intra:ph_start_intra + base_ph_num_tokens, :]
+            base_ph_val = _base_ph_full_v[..., ph_start_intra:ph_start_intra + base_ph_num_tokens, :]
+        else:
+            base_ph_key, base_ph_val = self.read_kv_from_blocks(base_ph_block_table, base_ph_num_tokens)
         base_pf_key, base_pf_val = self.read_kv_from_blocks(base_pf_block_table, base_pf_num_tokens)
 
         # Compute similarity weights (same logic as KVCOMMEngine) without stacking
@@ -516,16 +541,12 @@ class PagedKVCOMMEngine:
         # Apply delta to base and write to new blocks
         new_ph_key = base_ph_key + ph_delta_sum_k.to(base_ph_key.dtype)
         new_ph_val = base_ph_val + ph_delta_sum_v.to(base_ph_val.dtype)
-        new_ph_key[0] = base_ph_key[0]  # Keep layer 0 unchanged (KVCOMM convention)
-        new_ph_val[0] = base_ph_val[0]
 
         new_ph_blocks = self.allocate_blocks_for_tokens(base_ph_num_tokens)
         self.write_kv_to_blocks(new_ph_blocks, new_ph_key, new_ph_val, base_ph_num_tokens)
 
         new_pf_key = base_pf_key + pf_delta_sum_k.to(base_pf_key.dtype)
         new_pf_val = base_pf_val + pf_delta_sum_v.to(base_pf_val.dtype)
-        new_pf_key[0] = base_pf_key[0]
-        new_pf_val[0] = base_pf_val[0]
 
         new_pf_blocks = self.allocate_blocks_for_tokens(base_pf_num_tokens)
         self.write_kv_to_blocks(new_pf_blocks, new_pf_key, new_pf_val, base_pf_num_tokens)
@@ -681,9 +702,6 @@ class PagedKVCOMMEngine:
             new_ph_key = base_ph_key + ph_delta_sum_k.to(base_ph_key.dtype)
             new_ph_val = base_ph_val + ph_delta_sum_v.to(base_ph_val.dtype)
 
-        new_ph_key[0] = base_ph_key[0]
-        new_ph_val[0] = base_ph_val[0]
-
         new_ph_blocks = self.allocate_blocks_for_tokens(base_ph_num_tokens)
         self.write_kv_to_blocks(new_ph_blocks, new_ph_key, new_ph_val, base_ph_num_tokens)
 
@@ -731,9 +749,6 @@ class PagedKVCOMMEngine:
                 pf_delta_v += w * dv
             new_pf_key = base_pf_key + pf_delta_k.to(base_pf_key.dtype)
             new_pf_val = base_pf_val + pf_delta_v.to(base_pf_val.dtype)
-
-        new_pf_key[0] = base_pf_key[0]
-        new_pf_val[0] = base_pf_val[0]
 
         new_pf_blocks = self.allocate_blocks_for_tokens(base_pf_num_tokens)
         self.write_kv_to_blocks(new_pf_blocks, new_pf_key, new_pf_val, base_pf_num_tokens)

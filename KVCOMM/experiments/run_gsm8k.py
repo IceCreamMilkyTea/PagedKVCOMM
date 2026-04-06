@@ -100,6 +100,7 @@ def parse_args():
     parser.add_argument("--local-ref-consistency-threshold", type=float, default=None, help="Max relative std for cross_delta_consistency gate.")
     parser.add_argument("--local-ref-weight-threshold", type=float, default=None, help="Min max-weight for weight_confidence gate.")
     parser.add_argument("--no-current-round-sharing", action="store_true", help="Disable current-round KV sharing (ablation baseline).")
+    parser.add_argument("--crs-priority", action="store_true", help="Bypass dense_prefill for user_question anchors even without own delta (CRS priority ablation).")
     args = parser.parse_args()
 
     if len(args.agent_names) != len(args.agent_nums):
@@ -123,8 +124,9 @@ async def main():
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(args.mode, len(agent_names))
 
-    logger.info("[CONFIG] Model: {}, Mode: {}, Execution: {}, Flash Attention: {}",
-                args.llm_name, args.mode, args.execution_mode, args.use_flash_attention)
+    logger.info("[CONFIG] Model: {}, Mode: {}, Execution: {}, Flash Attention: {}, CRS Priority: {}",
+                args.llm_name, args.mode, args.execution_mode, args.use_flash_attention,
+                getattr(args, "crs_priority", False))
 
     kv_config: Optional[KVCommConfig] = None
     if args.execution_mode == "allow_kv_reuse":
@@ -139,6 +141,7 @@ async def main():
             local_ref_consistency_threshold=args.local_ref_consistency_threshold,
             local_ref_weight_threshold=args.local_ref_weight_threshold,
             use_current_round_sharing=not args.no_current_round_sharing,
+            crs_priority=args.crs_priority or None,
         )
     else:
         kv_config = KVCommConfig.from_env()
@@ -155,6 +158,8 @@ async def main():
 
     num_batches = int(len(dataset) / args.batch_size)
     total_solved, total_executed = 0, 0
+    node_solved: dict = {}   # node_id -> solved count
+    node_executed: dict = {}  # node_id -> executed count
 
     for i_batch in range(num_batches):
         logger.opt(colors=True).info(f"<blue>[BATCH]</blue> {i_batch} {'-' * 40}")
@@ -200,6 +205,7 @@ async def main():
 
         batch_results = await asyncio.gather(*tasks)
         results_by_task = {result.get("task"): result.get("answers", []) for result in batch_results}
+        node_outputs_by_task = {result.get("task"): result.get("node_outputs", {}) for result in batch_results}
         data = load_result(result_file)
 
         for info in meta_info:
@@ -242,6 +248,30 @@ async def main():
             f"<blue>[BATCH TIME]</blue> {time.time() - start_ts:.3f}s"
         )
         logger.opt(colors=True).info(f"<blue>[ACCURACY]</blue> {accuracy:.4f}")
+
+        # Per-node accuracy (debug only, not counted in timing)
+        if args.execution_mode == "allow_kv_reuse":
+            for info in meta_info:
+                task = info["task"]
+                true_answer = info["answer"]
+                node_outs = node_outputs_by_task.get(task, {})
+                for node_id, outputs in sorted(node_outs.items()):
+                    node_solved.setdefault(node_id, 0)
+                    node_executed.setdefault(node_id, 0)
+                    text = outputs[0] if outputs else ""
+                    pred = await get_pred_value(text)
+                    try:
+                        ok = float(pred) == float(true_answer)
+                    except Exception:
+                        ok = False
+                    node_solved[node_id] += ok
+                    node_executed[node_id] += 1
+            node_acc_str = "  ".join(
+                f"node={nid}: {node_solved[nid]/node_executed[nid]:.4f}"
+                for nid in sorted(node_solved)
+            )
+            logger.opt(colors=True).info(f"<yellow>[NODE_ACCURACY]</yellow> {node_acc_str}")
+
         metrics_recorder.log_cumulative(batch_index=i_batch)
 
     # ── Delta similarity diagnostic (cross-agent offset analysis) ──

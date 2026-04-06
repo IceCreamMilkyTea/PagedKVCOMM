@@ -18,6 +18,7 @@ env/
 logs/
 *.log
 *.err
+slurm-*.out
 KVCOMM/logs/
 
 # Experiment results & run artifacts
@@ -53,3 +54,5 @@ datasets/MMLU/
 # OS
 .DS_Store
 Thumbs.db
+
+.claude/

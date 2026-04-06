@@ -631,9 +631,21 @@ class LLMChat(LLM):
             )
 
             if has_flag is True and not has_delta:
+                cfg = getattr(self, "config", None)
+                # crs_priority: always bypass dense_prefill for user_question,
+                # relying on CRS or historical offset (ablation switch).
+                crs_prio = getattr(cfg, "crs_priority", False)
+                if crs_prio and ph_id == "user_question":
+                    logger.info(
+                        "[ANCHOR_CHECK:hf] node={} ph_id={} "
+                        "crs_priority=True -> bypass dense_prefill (kv_reuse)",
+                        getattr(self, "node_id", "?"),
+                        ph_id,
+                    )
+                    continue
                 # CRS bypass: if upstream agent already has a delta for this message
                 # and CRS is enabled, allow kv_reuse (same logic as paged has_active_anchor).
-                crs_on = getattr(getattr(self, "config", None), "use_current_round_sharing", True)
+                crs_on = getattr(cfg, "use_current_round_sharing", True)
                 if crs_on and ph_id == "user_question":
                     anchor_entry = state.anchors.get(ph_id, {}).get(message, {})
                     has_upstream = any(
@@ -805,10 +817,21 @@ class LLMChat(LLM):
                             f"<green>The message has repeatedly received for message '{safe_message}' at placeholder '{safe_ph_id}'. So we will reuse the KV cache.</green>"
                         )
                         return "kv_reuse"
+                    cfg = getattr(self, "config", None)
+                    # crs_priority: always bypass dense_prefill for user_question (ablation).
+                    crs_prio = getattr(cfg, "crs_priority", False)
+                    if crs_prio and ph_id == "user_question":
+                        logger.info(
+                            "[UPDATE_INPUT_ANCHOR:hf] node={} ph_id={} "
+                            "crs_priority=True -> bypass dense_prefill (kv_reuse)",
+                            getattr(self, "node_id", "?"),
+                            ph_id,
+                        )
+                        continue
                     # CRS bypass: if an upstream agent already has a delta for this
                     # placeholder in the current round, kv_reuse + CRS offset is
                     # sufficient — no need to force dense_prefill.
-                    crs_on = getattr(getattr(self, "config", None), "use_current_round_sharing", True)
+                    crs_on = getattr(cfg, "use_current_round_sharing", True)
                     if crs_on and ph_id == "user_question":
                         anchor_entry = state.anchors.get(ph_id, {}).get(message, {})
                         has_upstream = any(

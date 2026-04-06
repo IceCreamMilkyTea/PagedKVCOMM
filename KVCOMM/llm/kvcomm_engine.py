@@ -963,23 +963,19 @@ class KVCOMMEngine:
         updated_placeholder_key = (
             real_key_embedding + layer_total_delta_key_for_placeholder.to(real_key_embedding.dtype)
         )
-        updated_placeholder_key[0] = real_key_embedding[0]
 
         updated_placeholder_value = (
             real_value_embedding + layer_total_value_delta_for_placeholder.to(real_value_embedding.dtype)
         )
-        updated_placeholder_value[0] = real_value_embedding[0]
         _assign_stack_to_cache(new_placeholder_cache, updated_placeholder_key, updated_placeholder_value)
         _set_seen_tokens(new_placeholder_cache, _safe_seq_len(base_placeholder_cache))
 
         new_prefix_cache = base_prefix_cache.copy()
         updated_prefix_key = base_prefix_key + layer_total_delta_key_for_prefix.to(base_prefix_key.dtype)
-        updated_prefix_key[0] = base_prefix_key[0]
 
         updated_prefix_value = (
             base_prefix_value + layer_total_value_delta_for_prefix.to(base_prefix_value.dtype)
         )
-        updated_prefix_value[0] = base_prefix_value[0]
         _assign_stack_to_cache(new_prefix_cache, updated_prefix_key, updated_prefix_value)
         _set_seen_tokens(new_prefix_cache, _safe_seq_len(base_prefix_cache))
 
@@ -1122,9 +1118,7 @@ class KVCOMMEngine:
         # --- 6. Apply: result = upstream_KV + cross_delta -------------
         new_placeholder_cache = base_placeholder_cache.copy()
         updated_ph_key = upstream_ph_key + ph_cross_delta_key.to(upstream_ph_key.dtype)
-        updated_ph_key[0] = real_key_embedding[0]  # layer 0 unchanged
         updated_ph_val = upstream_ph_val + ph_cross_delta_val.to(upstream_ph_val.dtype)
-        updated_ph_val[0] = real_value_embedding[0]
         _assign_stack_to_cache(new_placeholder_cache, updated_ph_key, updated_ph_val)
         _set_seen_tokens(new_placeholder_cache, _safe_seq_len(base_placeholder_cache))
 
@@ -1162,9 +1156,6 @@ class KVCOMMEngine:
             ])
             updated_pf_key = base_pf_key + (w_k_pf * pf_key_stack).sum(0).to(base_pf_key.dtype)
             updated_pf_val = base_pf_val + (w_v_pf * pf_val_stack).sum(0).to(base_pf_val.dtype)
-
-        updated_pf_key[0] = base_pf_key[0]
-        updated_pf_val[0] = base_pf_val[0]
 
         new_prefix_cache = base_prefix_cache.copy()
         _assign_stack_to_cache(new_prefix_cache, updated_pf_key, updated_pf_val)
@@ -1629,8 +1620,6 @@ class KVCOMMEngine:
 
             new_k = base_k + (up_dk - cross_k).to(base_k.dtype)
             new_v = base_v + (up_dv - cross_v).to(base_v.dtype)
-            new_k[0] = base_k[0]  # layer-0 convention
-            new_v[0] = base_v[0]
 
             new_ph = base_placeholder_cache.copy()
             _assign_stack_to_cache(new_ph, new_k, new_v)

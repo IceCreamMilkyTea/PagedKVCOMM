@@ -531,6 +531,8 @@ class PagedLLMChat(LLM):
                 ph_start_block = ph_start // bs
                 ph_end_block = (ph_end - 1) // bs + 1
                 ph_num = ph_end - ph_start
+                # How far into its first block does the placeholder start?
+                ph_start_intra = ph_start % bs
 
                 # Skip if invalid or overlapping with the previous span's blocks
                 if (ph_start_block < current_block
@@ -550,7 +552,33 @@ class PagedLLMChat(LLM):
                     current_block = ph_end_block
                     continue
 
-                new_ph_blocks: Optional[List[int]] = None
+                # ── How many tokens does this block range need to cover? ───────
+                # When ph_start_intra > 0 the output block must also cover the
+                # prefix tokens that share the first block with the placeholder.
+                # Similarly the last block may contain post-ph prompt tokens.
+                blk_start_tok = ph_start_block * bs
+                blk_end_tok   = min(ph_end_block * bs, prompt_num_tokens)
+                tokens_for_block = blk_end_tok - blk_start_tok
+                # tokens_for_block == ph_num when ph_start_intra==0 and ph fills
+                # the block(s) exactly; otherwise it is larger.
+
+                # ── Read full base block KV when we need to merge prefix/suffix ─
+                # We always read tokens_for_block so we have the complete picture.
+                if ph_start_intra > 0 or tokens_for_block != ph_num:
+                    base_full_k, base_full_v = self.paged_kv_engine.read_kv_from_blocks(
+                        base_ph_blocks, tokens_for_block
+                    )
+                    # Slice just the placeholder portion for delta computation.
+                    base_ph_k = base_full_k[..., ph_start_intra:ph_start_intra + ph_num, :]
+                    base_ph_v = base_full_v[..., ph_start_intra:ph_start_intra + ph_num, :]
+                    need_merge = True
+                else:
+                    base_full_k = base_full_v = None
+                    base_ph_k = base_ph_v = None
+                    need_merge = False
+
+                new_ph_k: Optional[torch.Tensor] = None
+                new_ph_v: Optional[torch.Tensor] = None
 
                 # ── Path 1: current-round sharing (user_question only) ────────
                 # Only user_question has identical prefix across agents (cross-delta ≈ 0).
@@ -570,9 +598,16 @@ class PagedLLMChat(LLM):
                         up_info = cur_entry.agent_deltas[up_id]
                         if int(up_info.get("ph_delta_num_tokens", 0) or 0) >= ph_num:
                             try:
-                                base_k, base_v = self.paged_kv_engine.read_kv_from_blocks(
-                                    base_ph_blocks, ph_num
-                                )
+                                # Use the correctly positioned base KV slice.
+                                base_k = base_ph_k if need_merge else \
+                                    self.paged_kv_engine.read_kv_from_blocks(base_ph_blocks, ph_num)[0]
+                                base_v = base_ph_v if need_merge else \
+                                    self.paged_kv_engine.read_kv_from_blocks(base_ph_blocks, ph_num)[1]
+                                if not need_merge:
+                                    base_k, base_v = self.paged_kv_engine.read_kv_from_blocks(
+                                        base_ph_blocks, ph_num
+                                    )
+
                                 up_dk, up_dv = self.paged_kv_engine.read_kv_from_blocks(
                                     up_info["ph_delta_blocks"], ph_num
                                 )
@@ -610,14 +645,8 @@ class PagedLLMChat(LLM):
                                         cross_k += w * (up_h_k[..., :ph_num, :] - sl_h_k[..., :ph_num, :])
                                         cross_v += w * (up_h_v[..., :ph_num, :] - sl_h_v[..., :ph_num, :])
 
-                                new_k = base_k + (up_dk - cross_k)
-                                new_v = base_v + (up_dv - cross_v)
-                                new_k[0] = base_k[0]   # KVCOMM layer-0 convention
-                                new_v[0] = base_v[0]
-                                new_ph_blocks = self.paged_kv_engine.allocate_blocks_for_tokens(ph_num)
-                                self.paged_kv_engine.write_kv_to_blocks(
-                                    new_ph_blocks, new_k, new_v, ph_num
-                                )
+                                new_ph_k = base_k + (up_dk - cross_k)
+                                new_ph_v = base_v + (up_dv - cross_v)
                                 any_offset = True
                                 logger.info(
                                     "[CUR_ROUND_SHARE:paged] node={} ph_id={} upstream={} "
@@ -628,10 +657,10 @@ class PagedLLMChat(LLM):
                                 # Store this node's CRS-derived delta so future
                                 # offset_kv_cache rounds can use it (avoids silently
                                 # skipping this anchor due to missing agent_deltas entry).
-                                # ph delta = new_k - base_k; pf delta = 0 (CRS doesn't touch prefix).
+                                # ph delta = new_ph_k - base_k; pf delta = 0.
                                 try:
-                                    ph_delta_k = (new_k - base_k).contiguous()
-                                    ph_delta_v = (new_v - base_v).contiguous()
+                                    ph_delta_k = (new_ph_k - base_k).contiguous()
+                                    ph_delta_v = (new_ph_v - base_v).contiguous()
                                     delta_blocks = self.paged_kv_engine.allocate_blocks_for_tokens(ph_num)
                                     self.paged_kv_engine.write_kv_to_blocks(
                                         delta_blocks, ph_delta_k, ph_delta_v, ph_num
@@ -661,10 +690,10 @@ class PagedLLMChat(LLM):
                                     "[CUR_ROUND_SHARE:paged] ph_id={} error: {}; trying KVCOMM",
                                     ph_id, exc,
                                 )
-                                new_ph_blocks = None
+                                new_ph_k = new_ph_v = None
 
                 # ── Path 2: KVCOMM anchor matching (ph only, pf_num=0) ────────
-                if new_ph_blocks is None:
+                if new_ph_k is None:
                     anchor_msgs = [
                         m for m in self.paged_kv_engine.anchors.get(ph_id, {}).keys()
                         if m != message_key
@@ -682,23 +711,74 @@ class PagedLLMChat(LLM):
                             base_pf_num_tokens=0,
                             anchor_list=anchor_msgs,
                             temperature=1.0,
+                            ph_start_intra=ph_start_intra,
                         )
-                        new_ph_blocks = result_ph
+                        # offset_kv_cache returns a block with ph_num offset tokens at pos 0.
+                        # Read them back as tensors so we can merge below.
                         if result_ph != base_ph_blocks:
+                            new_ph_k, new_ph_v = self.paged_kv_engine.read_kv_from_blocks(
+                                result_ph, ph_num
+                            )
+                            self.paged_kv_engine.free_blocks(result_ph)
                             any_offset = True
                             stats["offset_effective"] += 1
+                            logger.info(
+                                "[KV_REUSE_OFFSET:paged] node={} ph_id={} ph_start={} ph_num={} "
+                                "ph_start_intra={} tokens_for_block={} need_merge={} anchor_msgs={}",
+                                getattr(self, "node_id", "?"),
+                                ph_id, ph_start, ph_num,
+                                ph_start_intra, tokens_for_block, need_merge,
+                                len(anchor_msgs),
+                            )
+                        else:
+                            # offset_kv_cache returned base unchanged (ref incremented)
+                            self.paged_kv_engine.free_blocks(result_ph)
+                            logger.info(
+                                "[KV_REUSE_NO_OFFSET:paged] node={} ph_id={} offset_kv_cache returned base unchanged",
+                                getattr(self, "node_id", "?"),
+                                ph_id,
+                            )
+
+                # ── Assemble output block(s) ──────────────────────────────────
+                new_ph_blocks: Optional[List[int]] = None
+                if new_ph_k is not None:
+                    if need_merge:
+                        # Merge: start from base full-block KV, overlay the
+                        # offset-applied placeholder slice.
+                        assert base_full_k is not None
+                        merged_k = base_full_k.clone()
+                        merged_v = base_full_v.clone()
+                        merged_k[..., ph_start_intra:ph_start_intra + ph_num, :] = new_ph_k
+                        merged_v[..., ph_start_intra:ph_start_intra + ph_num, :] = new_ph_v
+                        new_ph_blocks = self.paged_kv_engine.allocate_blocks_for_tokens(tokens_for_block)
+                        self.paged_kv_engine.write_kv_to_blocks(
+                            new_ph_blocks, merged_k, merged_v, tokens_for_block
+                        )
+                    else:
+                        # Placeholder perfectly fills its block(s): write directly.
+                        new_ph_blocks = self.paged_kv_engine.allocate_blocks_for_tokens(ph_num)
+                        self.paged_kv_engine.write_kv_to_blocks(
+                            new_ph_blocks, new_ph_k, new_ph_v, ph_num
+                        )
 
                 # ── Fallback: base template blocks ────────────────────────────
                 if new_ph_blocks is None:
-                    self.paged_kv_engine.increment_ref(base_ph_blocks)
-                    new_ph_blocks = base_ph_blocks
+                    if need_merge:
+                        # Use the first base ph block only (it covers tokens_for_block).
+                        self.paged_kv_engine.increment_ref([base_ph_blocks[0]])
+                        new_ph_blocks = [base_ph_blocks[0]]
+                    else:
+                        self.paged_kv_engine.increment_ref(base_ph_blocks)
+                        new_ph_blocks = base_ph_blocks
 
                 to_free.append(new_ph_blocks)
                 combined_blocks.extend(new_ph_blocks)
                 current_block = ph_end_block
 
-            # ── tail: base blocks after the last span ─────────────────────────
-            tail = base_block_table[current_block:]
+            # ── tail: base blocks after the last span, capped at expected_blocks ─
+            # Do NOT blindly append all remaining template blocks – the template
+            # may have been built for a longer prompt than the current request.
+            tail = base_block_table[current_block:expected_blocks]
             if tail:
                 self.paged_kv_engine.increment_ref(tail)
                 combined_blocks.extend(tail)
@@ -717,6 +797,13 @@ class PagedLLMChat(LLM):
                 return None, 0, stats
 
             stats["offset_applied"] = True
+            logger.info(
+                "[KV_REUSE_PREFIX_BUILT:paged] node={} combined_blocks={} expected={} "
+                "prompt_num_tokens={} ph_items={}",
+                getattr(self, "node_id", "?"),
+                len(combined_blocks), expected_blocks, prompt_num_tokens,
+                [(ph_id, ph_start, ph_end) for ph_id, (ph_start, ph_end) in valid_ph_items],
+            )
             return combined_blocks, prompt_num_tokens, stats
 
         except Exception:
@@ -1305,6 +1392,7 @@ class PagedLLMChat(LLM):
                             max_anchor_num=self.config.max_anchor_num,
                             window_length=self.config.window_size,
                             free_ratio_threshold=self.config.proactive_evict_threshold,
+                            ph_start_intra=ph_start % bs,
                         )
                         reuse_stats["anchor_set_count"] += 1
                     else:
@@ -1759,12 +1847,23 @@ class PagedLLMChat(LLM):
                     not has_agent_delta,
                 )
                 if not has_agent_delta:
+                    cfg = getattr(self, "config", None)
+                    # crs_priority: always bypass dense_prefill for user_question (ablation).
+                    crs_prio = getattr(cfg, "crs_priority", False)
+                    if crs_prio and ph_id == "user_question":
+                        logger.info(
+                            "[ANCHOR_CHECK:paged] node={} ph_id={} "
+                            "crs_priority=True -> bypass dense_prefill (kv_reuse)",
+                            getattr(self, "node_id", "?"),
+                            ph_id,
+                        )
+                        continue
                     # Before forcing dense_prefill, check if an upstream agent
                     # already has a delta for this message in the current round.
                     # If so, current-round sharing can approximate self's KV
                     # (delta_self ≈ delta_upstream − cross_delta_historical),
                     # so dense_prefill is not needed.
-                    crs_on = getattr(getattr(self, "config", None), "use_current_round_sharing", True)
+                    crs_on = getattr(cfg, "use_current_round_sharing", True)
                     has_upstream_delta = crs_on and any(
                         aid != self.node_id for aid in agent_deltas
                     )

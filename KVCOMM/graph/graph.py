@@ -412,9 +412,22 @@ class Graph(ABC):
                 final_answers = self.nodes[list(self.nodes.keys())[-1]].outputs
                 LLMChat.finalize_request(request_uid)
                 metrics_recorder.finalize_request(request_uid)
+
+            # Collect intermediate node outputs (for per-node accuracy debug)
+            task_key = input["task"]
+            node_outputs = {}
+            for node_id, node in self.nodes.items():
+                if isinstance(node.outputs, dict):
+                    out = node.outputs.get(task_key, [])
+                else:
+                    out = node.outputs
+                if out:
+                    node_outputs[node_id] = out if isinstance(out, list) else [out]
+
             return {
-                "task": input["task"],
+                "task": task_key,
                 "answers": final_answers,
+                "node_outputs": node_outputs,
             }
 
         raise ValueError(f"Unsupported arun mode: {mode}")

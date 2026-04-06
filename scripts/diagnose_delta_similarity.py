@@ -196,6 +196,91 @@ def analyze_cross_offset_stability(
     return summary, records
 
 
+def analyze_crs_estimation_error(
+    data: Dict[str, Dict[str, Dict[str, torch.Tensor]]],
+) -> Tuple[dict, List[dict]]:
+    """
+    Directly measure CRS estimation accuracy.
+
+    For agent pair (i, j), query q_new, reference query q_old:
+        estimated_delta_j(q_new) = delta_i(q_new) + (delta_j(q_old) - delta_i(q_old))
+        true_delta_j(q_new) = delta_j(q_new)
+
+    Metric: cosine(estimated, true)  ← how accurate is the CRS estimate?
+
+    Uses each query as q_new once, averaged over all valid q_old choices.
+    """
+    records = []
+
+    for ph_id, messages in data.items():
+        msg_keys = sorted(messages.keys())
+        if len(msg_keys) < 2:
+            continue
+
+        for q_new in msg_keys:
+            agents_new = messages[q_new]
+            agent_ids = sorted(agents_new.keys())
+            if len(agent_ids) < 2:
+                continue
+
+            for ai, aj in combinations(agent_ids, 2):
+                if ai not in agents_new or aj not in agents_new:
+                    continue
+
+                true_j = agents_new[aj]
+                upstream_i_new = agents_new[ai]
+
+                # Average CRS estimate over all valid reference queries
+                estimates = []
+                for q_old in msg_keys:
+                    if q_old == q_new:
+                        continue
+                    agents_old = messages[q_old]
+                    if ai not in agents_old or aj not in agents_old:
+                        continue
+                    di_old = agents_old[ai]
+                    dj_old = agents_old[aj]
+
+                    # Align all to same token length
+                    aligned = _align_tokens(upstream_i_new, true_j, di_old, dj_old)
+                    i_new_a, j_new_a, i_old_a, j_old_a = aligned
+
+                    cross_old = j_old_a.float() - i_old_a.float()
+                    estimate = i_new_a.float() + cross_old
+                    estimates.append(estimate)
+
+                if not estimates:
+                    continue
+
+                avg_estimate = torch.stack(estimates).mean(0)
+                true_j_a, avg_est_a = _align_tokens(true_j.float(), avg_estimate)
+                cos = _cosine(true_j_a, avg_est_a)
+
+                records.append({
+                    "ph_id": ph_id,
+                    "q_new": q_new[:50],
+                    "agent_upstream": ai,
+                    "agent_target": aj,
+                    "cosine_estimate_vs_true": cos,
+                    "num_ref_queries": len(estimates),
+                })
+
+    if not records:
+        return {"error": "no valid CRS estimation pairs found"}, []
+
+    all_cos = [r["cosine_estimate_vs_true"] for r in records]
+    summary = {
+        "num_comparisons": len(records),
+        "cosine_mean": float(np.mean(all_cos)),
+        "cosine_std": float(np.std(all_cos)),
+        "cosine_min": float(np.min(all_cos)),
+        "cosine_max": float(np.max(all_cos)),
+        "high_similarity_count": sum(1 for c in all_cos if c > 0.9),
+        "very_high_similarity_count": sum(1 for c in all_cos if c > 0.95),
+    }
+    return summary, records
+
+
 def _compare_cross_offsets(
     ph_id: str,
     msg1: str, msg2: str,
@@ -417,7 +502,29 @@ def run_diagnostic(
         print("(Need ≥2 messages per ph_id, each with ≥2 agents)")
         return
 
-    # Analyze
+    # Analyze: CRS estimation accuracy
+    crs_summary, crs_records = analyze_crs_estimation_error(data)
+    if "error" not in crs_summary:
+        print(f"\n{'='*65}")
+        print("CRS ESTIMATION ACCURACY")
+        print(f"{'='*65}")
+        print(f"  Comparisons (q_new × agent pairs)   : {crs_summary['num_comparisons']}")
+        print(f"  cosine(CRS_estimate, true_delta)    : {crs_summary['cosine_mean']:.4f} ± {crs_summary['cosine_std']:.4f}")
+        print(f"    min={crs_summary['cosine_min']:.4f}  max={crs_summary['cosine_max']:.4f}")
+        print(f"  High accuracy (cos > 0.9)           : {crs_summary['high_similarity_count']} / {crs_summary['num_comparisons']}")
+        print(f"  Very high accuracy (cos > 0.95)     : {crs_summary['very_high_similarity_count']} / {crs_summary['num_comparisons']}")
+        if crs_summary["cosine_mean"] > 0.9:
+            print("  → CRS estimate is HIGHLY ACCURATE.")
+        elif crs_summary["cosine_mean"] > 0.7:
+            print("  → CRS estimate is MODERATELY ACCURATE.")
+        else:
+            print("  → CRS estimate is INACCURATE.")
+        crs_out = out / "crs_estimation_accuracy.json"
+        with open(crs_out, "w") as f:
+            json.dump({"summary": crs_summary, "records": crs_records}, f, indent=2)
+        print(f"  JSON saved → {crs_out}")
+
+    # Analyze: cross-offset stability across queries
     summary, records = analyze_cross_offset_stability(data)
 
     if "error" in summary:
