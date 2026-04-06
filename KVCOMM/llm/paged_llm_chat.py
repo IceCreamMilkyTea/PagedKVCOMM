@@ -1807,6 +1807,27 @@ class PagedLLMChat(LLM):
                         candidate_num,
                         len(candidate_blocks),
                     )
+                    # In paged mode, condition KV is injected via block references
+                    # (not per-agent delta). Store a zero-size stub delta for the
+                    # calling agent so has_active_anchor won't force dense_prefill
+                    # on every subsequent request. The stub is skipped in
+                    # apply_anchor_offset (ph_delta_num_tokens=0 < base_ph_num_tokens).
+                    with self.paged_kv_engine._lock:
+                        ph_store = self.paged_kv_engine.anchors.get(anchor_key, {})
+                        entry = ph_store.get(message)
+                        if entry is not None and self.node_id not in entry.agent_deltas:
+                            entry.agent_deltas[self.node_id] = {
+                                "ph_delta_blocks": [],
+                                "ph_delta_num_tokens": 0,
+                                "pf_delta_blocks": [],
+                                "pf_delta_num_tokens": 0,
+                            }
+                            logger.info(
+                                "[CONDITION_STUB_DELTA:paged] node={} ph_id={} message={} stored stub delta to prevent force_dense",
+                                getattr(self, "node_id", "?"),
+                                anchor_key,
+                                safe_msg,
+                            )
             cond_info_bucket[message] = 0
             cond_info_bucket[message_key] = 0
             global_bucket[message] = [0, candidate_num]

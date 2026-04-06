@@ -245,6 +245,11 @@ def analyze_crs_estimation_error(
                     aligned = _align_tokens(upstream_i_new, true_j, di_old, dj_old)
                     i_new_a, j_new_a, i_old_a, j_old_a = aligned
 
+                    # Skip if alignment truncated below true_j's token count
+                    # (e.g. a short condition delta mixing with longer user_question deltas)
+                    if i_new_a.shape[-2] < true_j.shape[-2]:
+                        continue
+
                     cross_old = j_old_a.float() - i_old_a.float()
                     estimate = i_new_a.float() + cross_old
                     estimates.append(estimate)

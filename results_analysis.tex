@@ -1,0 +1,293 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{amsmath}
+
+\lstset{basicstyle=\ttfamily\footnotesize, breaklines=true, frame=single}
+
+\title{Experiment Results Analysis:\\PagedKVCOMM Ablation Study (April 5, 2026)}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+%-----------------------------------------------------------------------
+\section{Experiment Overview}
+%-----------------------------------------------------------------------
+
+Two jobs were submitted on April 5, 2026, targeting an RTX Pro 6000 GPU node
+(\texttt{compsci-gpu} partition).  Table~\ref{tab:exp_overview} summarises
+their configuration.
+
+\begin{table}[h]
+\centering
+\caption{Experiment configuration summary.}
+\label{tab:exp_overview}
+\resizebox{\textwidth}{!}{%
+\begin{tabular}{lll}
+\toprule
+\textbf{Property} & \textbf{Job 10939240 (Stage-1 Baseline)} & \textbf{Job 10939241 (HF CRS Ablation)} \\
+\midrule
+SLURM Job ID      & 10939240 & 10939241 \\
+Script            & \texttt{KVCOMM/run\_ablation\_stage1.sh} & \texttt{scripts/run\_hf\_crs\_ablation.sh} \\
+Log               & \texttt{KVCOMM/logs/4-5\_page\_abl\_stage1\_rtx\_pro/} & \texttt{logs/hf\_crs\_ablation\_rtx\_pro\_10939241.log} \\
+                  & \quad\texttt{page\_abl\_stage1\_rtx\_pro\_10939240.log} & \\
+Result dir        & \texttt{KVCOMM/result/ablation\_1\_baseline\_rtx\_pro/} & \texttt{KVCOMM/result/hf\_crs\_ablation\_crs\_rtx\_pro\_20260405\_131449/} \\
+Backend           & \texttt{gpt\_chat} & HuggingFace (\texttt{hf}) \\
+\texttt{KVCOMM\_PAGED}   & 0 (disabled) & -- \\
+CRS               & \textbf{OFF} (\texttt{--no-current-round-sharing}) & \textbf{ON} \\
+Cross-round KV reuse & ON (\texttt{--execution\_mode allow\_kv\_reuse}) & ON \\
+Flash Attention   & OFF & -- \\
+Completion        & \texttt{[1/3] Completed} (stage 1 of 3) & \texttt{[1/1] Done} \\
+\bottomrule
+\end{tabular}}
+\end{table}
+
+\noindent\textbf{Important note:} The two jobs use different inference backends
+(\texttt{gpt\_chat} vs.\ HuggingFace) and differ in CRS status simultaneously.
+They are \emph{not} a clean single-variable comparison; direct accuracy
+comparisons should be interpreted with this caveat in mind.
+
+%-----------------------------------------------------------------------
+\section{Overall Accuracy}
+%-----------------------------------------------------------------------
+
+\begin{table}[h]
+\centering
+\caption{Final cumulative accuracy per agent node at end of run.}
+\label{tab:overall_acc}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Job} & \textbf{Overall} & \textbf{Node 1} & \textbf{Node 2} & \textbf{Node 3} \\
+\midrule
+10939240 (gpt\_chat, no CRS) & 0.8218 & 0.7726 & 0.3730 & 0.7445 \\
+10939241 (hf, CRS ON)        & 0.7726 & 0.7748 & 0.3904 & 0.6588 \\
+\midrule
+$\Delta$ (CRS ON $-$ baseline) & $-0.049$ & $+0.002$ & $+0.017$ & $-0.086$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Observations.}
+\begin{itemize}
+  \item Overall accuracy is higher in the baseline (0.822 vs.\ 0.773), but the
+        two jobs differ in both backend and CRS, so the gap cannot be attributed
+        to CRS alone.
+  \item Node~1 accuracy is nearly identical across jobs ($\approx$0.77),
+        suggesting that the Math Solver role is robust to both backend and CRS
+        changes.
+  \item Node~2 is consistently the weakest node in both jobs ($\approx$0.37--0.39).
+        See Section~\ref{sec:node2} for a detailed analysis.
+  \item Node~3 drops noticeably when CRS is enabled (0.744 $\to$ 0.659,
+        $\Delta = -0.086$), making it the primary driver of the overall
+        accuracy gap.
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{Time to First Token (TTFT)}
+%-----------------------------------------------------------------------
+
+\begin{table}[h]
+\centering
+\caption{TTFT statistics broken down by execution mode, aggregated over all
+         agent nodes.}
+\label{tab:ttft}
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Job} & \textbf{Mode} & \textbf{N} & \textbf{Avg (s)} & \textbf{Min (s)} & \textbf{Max (s)} \\
+\midrule
+\multirow{2}{*}{10939240 (no CRS)} & dense\_prefill & 1573 & 0.0770 & 0.0439 & 0.1208 \\
+                                   & kv\_reuse      & 3703 & 0.2740 & 0.0378 & 1.2847 \\
+\midrule
+\multirow{2}{*}{10939241 (CRS ON)} & dense\_prefill &  866 & 0.0792 & 0.0523 & 0.1242 \\
+                                   & kv\_reuse      & 4410 & 0.2755 & 0.0373 & 1.3067 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Observations.}
+\begin{itemize}
+  \item TTFT is nearly identical between the two jobs for the same mode,
+        indicating that the backend and CRS differences do not affect
+        time-to-first-token.
+  \item \texttt{kv\_reuse} TTFT ($\approx$274--276\,ms) is \textbf{$\approx$3.5$\times$
+        higher} than \texttt{dense\_prefill} ($\approx$77--79\,ms).  This is
+        counter-intuitive: reusing a cached KV state incurs more latency than a
+        fresh prefill, suggesting that anchor retrieval and KV loading dominate
+        the overhead.
+  \item \texttt{kv\_reuse} max TTFT reaches 1.28--1.31\,s (17$\times$ higher
+        than average), indicating high variance likely caused by cache miss
+        penalties or large anchor KV tensors.
+  \item CRS ON increases the number of \texttt{kv\_reuse} invocations
+        (4410 vs.\ 3703), consistent with CRS providing more anchor candidates
+        for matching.
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{Node 2 Analysis: Mathematical Analyst}
+\label{sec:node2}
+%-----------------------------------------------------------------------
+
+\subsection{Prompt Design}
+
+Node~2 (Mathematical Analyst) uses the following system prompt:
+
+\begin{lstlisting}
+You are a mathematical analyst.
+You will be given a math problem, analysis and code from other agents.
+You need to first analyze the problem-solving process step by step,
+where the variables are represented by letters.
+Then you substitute the values into the analysis process to perform
+calculations and get the results.
+The last line of your output contains only the final result without
+any units, for example: The answer is 140
+You will be given some examples you may refer to.
+\end{lstlisting}
+
+\noindent The few-shot exemplars for Node~2 follow a two-phase template format:
+
+\begin{enumerate}
+  \item \textbf{Abstract phase}: describe the solution using placeholder variable
+        names (e.g., \texttt{\{ori\_tree\_num\}}, \texttt{\{after\_planted\_tree\_num\}}).
+  \item \textbf{Instantiation phase}: substitute concrete values and compute the
+        answer.
+\end{enumerate}
+
+Only \textbf{two} few-shot examples are provided (both involving very simple
+addition/subtraction), compared to three richer examples for Node~1.
+
+\subsection{Accuracy Breakdown by Execution Mode}
+
+\begin{table}[h]
+\centering
+\caption{Node 2 accuracy broken down by execution mode.}
+\label{tab:node2_mode}
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Job} & \textbf{Mode} & \textbf{Correct} & \textbf{Wrong} & \textbf{Total} & \textbf{Acc} \\
+\midrule
+\multirow{2}{*}{10939240 (no CRS)} & dense\_prefill & 209 & 176 & 385  & 0.5429 \\
+                                   & kv\_reuse      & 283 & 651 & 934  & 0.3030 \\
+\midrule
+\multirow{2}{*}{10939241 (CRS ON)} & dense\_prefill &  57 &  62 & 119  & 0.4790 \\
+                                   & kv\_reuse      & 458 & 742 & 1200 & 0.3817 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Observations.}
+\begin{itemize}
+  \item In the baseline, Node~2 accuracy drops from 0.54 (dense\_prefill) to
+        0.30 (kv\_reuse), a \textbf{$-$0.24 degradation}.  With wrong $=$ 2.3$\times$
+        correct under kv\_reuse, KV reuse is the primary driver of Node~2
+        failures, not the prompt design alone.
+  \item The template-style variable-placeholder format appears particularly
+        \textbf{sensitive to KV context pollution}: when a cached KV from a
+        different problem is reused, the model tends to substitute wrong variable
+        values or copy the previous problem's abstract template, as observed in
+        FinalRefer outputs (e.g., sheep problem answered with trees analysis).
+  \item With CRS ON, kv\_reuse accuracy of Node~2 \emph{recovers} slightly
+        (0.30 $\to$ 0.38), suggesting that cross-agent sharing within the same
+        round provides a stabilising signal that partially counteracts KV
+        pollution.
+  \item dense\_prefill sample count drops sharply under CRS (385 $\to$ 119),
+        since CRS causes more requests to satisfy anchor-matching conditions
+        and fall into kv\_reuse.
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{Node 3 Analysis: Programming Expert}
+\label{sec:node3}
+%-----------------------------------------------------------------------
+
+\subsection{Accuracy Breakdown by Execution Mode}
+
+\begin{table}[h]
+\centering
+\caption{Node 3 accuracy broken down by execution mode.}
+\label{tab:node3_mode}
+\begin{tabular}{llcccc}
+\toprule
+\textbf{Job} & \textbf{Mode} & \textbf{Correct} & \textbf{Wrong} & \textbf{Total} & \textbf{Acc} \\
+\midrule
+\multirow{2}{*}{10939240 (no CRS)} & dense\_prefill & 280 & 125 & 405  & 0.6914 \\
+                                   & kv\_reuse      & 702 & 212 & 914  & 0.7681 \\
+\midrule
+\multirow{2}{*}{10939241 (CRS ON)} & dense\_prefill & 101 &  60 & 161  & 0.6273 \\
+                                   & kv\_reuse      & 768 & 390 & 1158 & 0.6632 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Observations.}
+\begin{itemize}
+  \item Node~3 exhibits the \textbf{opposite pattern to Node~2}: in the
+        baseline, kv\_reuse accuracy (0.768) is \emph{higher} than
+        dense\_prefill (0.691), a $+$0.077 gain.  Reusing KV from similar
+        problems appears to provide useful structural context for Python code
+        generation.
+  \item The Programming Expert prompt enforces strict output format
+        (a self-contained Python function), which likely makes it more
+        robust to KV context from other problems---the code structure acts
+        as a natural ``guard'' against template pollution.
+  \item With CRS ON, both modes degrade: dense\_prefill $0.691 \to 0.627$,
+        kv\_reuse $0.768 \to 0.663$.  Node~3 is the \textbf{main contributor}
+        to the $-$0.086 overall accuracy drop under CRS, suggesting that
+        the additional cross-agent context introduced by CRS is harmful for
+        code generation (possibly introducing natural-language reasoning
+        patterns that conflict with the strict code-only output constraint).
+  \item This is consistent with the prompt instruction: \emph{``Do not include
+        anything other than Python code blocks in your response.''} CRS may
+        inject reasoning text from Node~1 or Node~2 into the KV context,
+        violating this constraint implicitly.
+\end{itemize}
+
+%-----------------------------------------------------------------------
+\section{Cross-Node and Cross-Mode Summary}
+%-----------------------------------------------------------------------
+
+\begin{table}[h]
+\centering
+\caption{Accuracy summary across all nodes and modes for both jobs.}
+\label{tab:summary}
+\begin{tabular}{llccc}
+\toprule
+\textbf{Job} & \textbf{Mode} & \textbf{Node 1} & \textbf{Node 2} & \textbf{Node 3} \\
+\midrule
+\multirow{2}{*}{10939240 (no CRS)}
+  & dense\_prefill & -- & 0.5429 & 0.6914 \\
+  & kv\_reuse      & -- & 0.3030 & 0.7681 \\
+\midrule
+\multirow{2}{*}{10939241 (CRS ON)}
+  & dense\_prefill & -- & 0.4790 & 0.6273 \\
+  & kv\_reuse      & -- & 0.3817 & 0.6632 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Key takeaways.}
+\begin{itemize}
+  \item \textbf{Node 2 (Mathematical Analyst)} is consistently the weakest
+        node.  Its template-based prompt is highly vulnerable to KV context
+        pollution; kv\_reuse degrades accuracy by $-$0.17 to $-$0.24.
+  \item \textbf{Node 3 (Programming Expert)} benefits from kv\_reuse in
+        isolation (no CRS), but is harmed by CRS.  Its strict code-only output
+        format provides partial robustness to KV pollution, but cross-agent
+        context from CRS conflicts with the code generation task.
+  \item \textbf{kv\_reuse TTFT is 3.5$\times$ higher} than dense\_prefill,
+        undermining the latency motivation for KV reuse.  The overhead likely
+        originates from anchor retrieval and KV tensor loading, not from
+        actual generation.
+  \item The two experiments are not a clean ablation (different backends and
+        CRS status co-vary).  A proper ablation should fix the backend and vary
+        only CRS, or vary only paged vs.\ non-paged, to isolate each effect.
+\end{itemize}
+
+\end{document}
