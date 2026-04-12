@@ -135,6 +135,8 @@ class PagedKVCOMMEngine:
 
         # Anchor store: ph_id → message → PagedAnchorEntry
         self.anchors: Dict[str, Dict[str, PagedAnchorEntry]] = {}
+        self._anchor_order: Dict[str, list] = {}
+        self.max_anchors_per_ph = 5
         self._lock = threading.Lock()
 
     # ─────────────────────── Block-level KV read/write ───────────────────────
@@ -143,6 +145,7 @@ class PagedKVCOMMEngine:
         self,
         block_table: List[int],
         num_tokens: int,
+        start_offset: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Read KV tensors from blocks. Returns [num_layers, num_kv_heads, num_tokens, head_dim].
 
@@ -162,9 +165,18 @@ class PagedKVCOMMEngine:
         k_flat = k_blocks.reshape(self.num_layers, -1, self.num_kv_heads, self.head_dim)
         v_flat = v_blocks.reshape(self.num_layers, -1, self.num_kv_heads, self.head_dim)
 
-        # Trim to actual num_tokens (last block may be partially filled)
-        k_out = k_flat[:, :num_tokens]  # [num_layers, num_tokens, num_kv_heads, head_dim]
-        v_out = v_flat[:, :num_tokens]
+        if start_offset < 0:
+            raise ValueError(f"read_kv_from_blocks: negative start_offset={start_offset}")
+        end_offset = start_offset + num_tokens
+        if end_offset > k_flat.shape[1]:
+            raise ValueError(
+                "read_kv_from_blocks range exceeds block capacity: "
+                f"start_offset={start_offset}, num_tokens={num_tokens}, "
+                f"capacity={k_flat.shape[1]}"
+            )
+
+        k_out = k_flat[:, start_offset:end_offset]
+        v_out = v_flat[:, start_offset:end_offset]
 
         # Transpose to match KVCOMM's convention: [num_layers, num_kv_heads, num_tokens, head_dim]
         k_out = k_out.transpose(1, 2)
@@ -248,6 +260,42 @@ class PagedKVCOMMEngine:
         for bid in block_ids:
             self.block_manager.blocks[bid].ref_count += 1
 
+    def _evict_old_anchors(self, ph_id: str) -> None:
+        """Evict oldest anchor entries when placeholder history exceeds the cap."""
+        order = self._anchor_order.get(ph_id, [])
+        ph_store = self.anchors.get(ph_id, {})
+        while len(order) > self.max_anchors_per_ph and order:
+            oldest_msg = order.pop(0)
+            entry = ph_store.pop(oldest_msg, None)
+            if entry is None:
+                continue
+            if entry.block_table:
+                self.free_blocks(entry.block_table)
+            for delta_info in entry.agent_deltas.values():
+                ph_delta = delta_info.get("ph_delta_blocks", [])
+                if ph_delta:
+                    self.free_blocks(ph_delta)
+                pf_delta = delta_info.get("pf_delta_blocks", [])
+                if pf_delta:
+                    self.free_blocks(pf_delta)
+
+    def clear_all_anchors(self) -> None:
+        """Free all anchors and their delta blocks."""
+        with self._lock:
+            for ph_store in self.anchors.values():
+                for entry in ph_store.values():
+                    if entry.block_table:
+                        self.free_blocks(entry.block_table)
+                    for delta_info in entry.agent_deltas.values():
+                        ph_delta = delta_info.get("ph_delta_blocks", [])
+                        if ph_delta:
+                            self.free_blocks(ph_delta)
+                        pf_delta = delta_info.get("pf_delta_blocks", [])
+                        if pf_delta:
+                            self.free_blocks(pf_delta)
+            self.anchors.clear()
+            self._anchor_order.clear()
+
     # ─────────────────────── Anchor Operations ───────────────────────
 
     def register_base_anchor(
@@ -256,6 +304,7 @@ class PagedKVCOMMEngine:
         message: str,
         block_table: List[int],
         num_tokens: int,
+        start_offset: int = 0,
     ) -> bool:
         """Register a base anchor entry directly from existing blocks.
 
@@ -268,7 +317,11 @@ class PagedKVCOMMEngine:
         if num_tokens <= 0 or not block_table:
             return False
 
-        ph_key, ph_val = self.read_kv_from_blocks(block_table, num_tokens)
+        ph_key, ph_val = self.read_kv_from_blocks(
+            block_table,
+            num_tokens,
+            start_offset=start_offset,
+        )
 
         with self._lock:
             ph_store = self.anchors.setdefault(ph_id, {})
@@ -282,6 +335,8 @@ class PagedKVCOMMEngine:
                 ph_key_embedding=ph_key,
                 ph_value_embedding=ph_val,
             )
+            self._anchor_order.setdefault(ph_id, []).append(message)
+            self._evict_old_anchors(ph_id)
             return True
 
     def set_anchor(
@@ -297,6 +352,10 @@ class PagedKVCOMMEngine:
         real_prefix_num_tokens: int,
         base_prefix_block_table: List[int],
         base_prefix_num_tokens: int,
+        real_block_offset: int = 0,
+        base_block_offset: int = 0,
+        real_prefix_block_offset: int = 0,
+        base_prefix_block_offset: int = 0,
     ) -> None:
         """Store an anchor entry using block references + delta.
 
@@ -310,7 +369,11 @@ class PagedKVCOMMEngine:
         referencing the same prefix share physical blocks → zero-copy.
         """
         # Read base KV for similarity (placeholder portion)
-        base_ph_key, base_ph_val = self.read_kv_from_blocks(base_block_table, base_num_tokens)
+        base_ph_key, base_ph_val = self.read_kv_from_blocks(
+            base_block_table,
+            base_num_tokens,
+            start_offset=base_block_offset,
+        )
 
         with self._lock:
             ph_store = self.anchors.setdefault(ph_id, {})
@@ -325,11 +388,17 @@ class PagedKVCOMMEngine:
                     ph_value_embedding=base_ph_val,
                 )
                 ph_store[message] = entry
+                self._anchor_order.setdefault(ph_id, []).append(message)
+                self._evict_old_anchors(ph_id)
             else:
                 entry = ph_store[message]
 
         # Compute placeholder delta: real - base
-        real_ph_key, real_ph_val = self.read_kv_from_blocks(real_block_table, real_num_tokens)
+        real_ph_key, real_ph_val = self.read_kv_from_blocks(
+            real_block_table,
+            real_num_tokens,
+            start_offset=real_block_offset,
+        )
         if real_ph_key.shape[2] != real_num_tokens or real_ph_key.shape[2] == 0:
             raise ValueError(
                 f"set_anchor: real_ph_key has {real_ph_key.shape[2]} tokens at dim 2, "
@@ -346,10 +415,14 @@ class PagedKVCOMMEngine:
         if real_prefix_num_tokens <= 0 or base_prefix_num_tokens <= 0:
             return
         real_pf_key, real_pf_val = self.read_kv_from_blocks(
-            real_prefix_block_table, real_prefix_num_tokens
+            real_prefix_block_table,
+            real_prefix_num_tokens,
+            start_offset=real_prefix_block_offset,
         )
         base_pf_key, base_pf_val = self.read_kv_from_blocks(
-            base_prefix_block_table, base_prefix_num_tokens
+            base_prefix_block_table,
+            base_prefix_num_tokens,
+            start_offset=base_prefix_block_offset,
         )
         pf_tokens = min(real_pf_key.shape[2], base_pf_key.shape[2], real_prefix_num_tokens, base_prefix_num_tokens)
         if pf_tokens <= 0:
@@ -478,12 +551,150 @@ class PagedKVCOMMEngine:
 
         return new_ph_blocks, base_ph_num_tokens, new_pf_blocks, base_pf_num_tokens
 
+    def offset_kv_cache_tail(
+        self,
+        *,
+        agent_id: str,
+        ph_id: str,
+        message: str,
+        base_tail_block_table: List[int],
+        base_tail_num_tokens: int,
+        base_pre_num_tokens: int,
+        base_ph_block_table: List[int],
+        base_ph_num_tokens: int,
+        base_ph_block_offset: int,
+        base_pf_block_table: List[int],
+        base_pf_num_tokens: int,
+        base_pf_block_offset: int,
+        runtime_ph_num_tokens: int,
+        runtime_pf_num_tokens: int,
+        query_block_table: List[int],
+        query_num_tokens: int,
+        query_block_offset: int,
+        anchor_list: List[str],
+        temperature: float = 1.0,
+    ) -> Tuple[Optional[List[int]], int]:
+        """Compose a new prompt tail by patching placeholder and suffix deltas."""
+        ph_store = self.anchors.get(ph_id, {})
+        if (
+            not ph_store
+            or not anchor_list
+            or not base_tail_block_table
+            or base_tail_num_tokens <= 0
+            or runtime_ph_num_tokens <= 0
+            or not query_block_table
+            or query_num_tokens <= 0
+        ):
+            return None, 0
+
+        valid_anchors = []
+        for msg in anchor_list:
+            entry = ph_store.get(msg)
+            if entry is None or entry.num_tokens < query_num_tokens:
+                continue
+            delta_info = entry.agent_deltas.get(agent_id)
+            if delta_info is None:
+                continue
+            if int(delta_info.get("ph_delta_num_tokens", 0) or 0) < runtime_ph_num_tokens:
+                continue
+            if runtime_pf_num_tokens > 0 and int(delta_info.get("pf_delta_num_tokens", 0) or 0) < runtime_pf_num_tokens:
+                continue
+            valid_anchors.append((msg, entry))
+
+        if not valid_anchors:
+            return None, 0
+
+        _, query_val = self.read_kv_from_blocks(
+            query_block_table,
+            query_num_tokens,
+            start_offset=query_block_offset,
+        )
+
+        diff_list = []
+        for _, entry in valid_anchors:
+            anchor_val = entry.ph_value_embedding[..., :query_num_tokens, :]
+            if anchor_val.device != query_val.device:
+                anchor_val = anchor_val.to(query_val.device, non_blocking=True)
+            diff_list.append((query_val - anchor_val).norm(2, dim=(0, 1, 2, 3)))
+        diff = torch.stack(diff_list, dim=0)
+        weights = torch.softmax(-diff.float() / temperature, dim=0).view(-1, 1, 1, 1)
+
+        if base_pre_num_tokens > 0:
+            base_pre_key, base_pre_val = self.read_kv_from_blocks(
+                base_tail_block_table,
+                base_pre_num_tokens,
+            )
+        else:
+            device = self.kv_cache.device
+            shape = (self.num_layers, self.num_kv_heads, 0, self.head_dim)
+            base_pre_key = torch.zeros(shape, device=device, dtype=self.k_cache.dtype)
+            base_pre_val = torch.zeros(shape, device=device, dtype=self.v_cache.dtype)
+
+        base_ph_key, base_ph_val = self.read_kv_from_blocks(
+            base_ph_block_table,
+            runtime_ph_num_tokens,
+            start_offset=base_ph_block_offset,
+        )
+        ph_delta_sum_k = torch.zeros_like(base_ph_key)
+        ph_delta_sum_v = torch.zeros_like(base_ph_val)
+        for idx, (_, entry) in enumerate(valid_anchors):
+            delta_info = entry.agent_deltas[agent_id]
+            dk, dv = self.read_kv_from_blocks(
+                delta_info["ph_delta_blocks"],
+                runtime_ph_num_tokens,
+            )
+            ph_delta_sum_k += weights[idx] * dk
+            ph_delta_sum_v += weights[idx] * dv
+
+        if runtime_pf_num_tokens > 0:
+            base_pf_key, base_pf_val = self.read_kv_from_blocks(
+                base_pf_block_table,
+                runtime_pf_num_tokens,
+                start_offset=base_pf_block_offset,
+            )
+            pf_delta_sum_k = torch.zeros_like(base_pf_key)
+            pf_delta_sum_v = torch.zeros_like(base_pf_val)
+            for idx, (_, entry) in enumerate(valid_anchors):
+                delta_info = entry.agent_deltas[agent_id]
+                dk, dv = self.read_kv_from_blocks(
+                    delta_info["pf_delta_blocks"],
+                    runtime_pf_num_tokens,
+                )
+                pf_delta_sum_k += weights[idx] * dk
+                pf_delta_sum_v += weights[idx] * dv
+            new_pf_key = base_pf_key + pf_delta_sum_k.to(base_pf_key.dtype)
+            new_pf_val = base_pf_val + pf_delta_sum_v.to(base_pf_val.dtype)
+            new_pf_key[0] = base_pf_key[0]
+            new_pf_val[0] = base_pf_val[0]
+        else:
+            shape = (self.num_layers, self.num_kv_heads, 0, self.head_dim)
+            new_pf_key = torch.zeros(shape, device=base_ph_key.device, dtype=base_ph_key.dtype)
+            new_pf_val = torch.zeros(shape, device=base_ph_val.device, dtype=base_ph_val.dtype)
+
+        new_ph_key = base_ph_key + ph_delta_sum_k.to(base_ph_key.dtype)
+        new_ph_val = base_ph_val + ph_delta_sum_v.to(base_ph_val.dtype)
+        new_ph_key[0] = base_ph_key[0]
+        new_ph_val[0] = base_ph_val[0]
+
+        new_tail_key = torch.cat([base_pre_key, new_ph_key, new_pf_key], dim=2)
+        new_tail_val = torch.cat([base_pre_val, new_ph_val, new_pf_val], dim=2)
+        new_tail_num_tokens = new_tail_key.shape[2]
+        new_tail_blocks = self.allocate_blocks_for_tokens(new_tail_num_tokens)
+        self.write_kv_to_blocks(
+            new_tail_blocks,
+            new_tail_key,
+            new_tail_val,
+            new_tail_num_tokens,
+        )
+        return new_tail_blocks, new_tail_num_tokens
+
     def predict_as_anchor(
         self,
         ph_id: str,
         candidate_block_table: List[int],
         candidate_num_tokens: int,
         anchor_messages: List[str],
+        candidate_start_offset: int = 0,
         top_p: float = 0.9,
         entropy_threshold: float = 0.5,
         max_compare_anchors: int = 64,
@@ -537,7 +748,11 @@ class PagedKVCOMMEngine:
             return True, activated
 
         # Read candidate KV
-        _, cand_val = self.read_kv_from_blocks(candidate_block_table, candidate_num_tokens)
+        _, cand_val = self.read_kv_from_blocks(
+            candidate_block_table,
+            candidate_num_tokens,
+            start_offset=candidate_start_offset,
+        )
 
         # Stream anchor distance computation to avoid large temporary tensors.
         diff_list = []

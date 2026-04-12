@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import json
 import os
 import re
@@ -54,6 +55,8 @@ def _escape_loguru_markup(text: Optional[str]) -> str:
 
 
 _LATENCY_IO_LOCK = threading.Lock()
+_RADIX_DEBUG_IO_LOCK = threading.Lock()
+_RADIX_TREE_DEBUG_IO_LOCK = threading.Lock()
 
 
 def _append_latency_record(target: Optional[Union[str, Path]], record: Dict[str, Any]) -> None:
@@ -77,6 +80,35 @@ def _append_latency_record(target: Optional[Union[str, Path]], record: Dict[str,
         existing.append(serializable)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(existing, f, ensure_ascii=False, indent=2)
+
+
+def _resolve_radix_debug_root(target: Optional[Union[str, Path]]) -> Optional[Path]:
+    if target is None:
+        return None
+    path = Path(target)
+    if path.suffix:
+        path = path.parent
+    return path / "debug" / "radix_traces"
+
+
+def _resolve_radix_tree_debug_root(target: Optional[Union[str, Path]]) -> Optional[Path]:
+    if target is None:
+        return None
+    path = Path(target)
+    if path.suffix:
+        path = path.parent
+    return path / "debug" / "radix_tree"
+
+
+def _load_json_dict(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+            return loaded if isinstance(loaded, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
 
 
 @LLMRegistry.register('PagedLLMChat')
@@ -106,6 +138,9 @@ class PagedLLMChat(LLM):
     _paged_kv_engine: Optional[PagedKVCOMMEngine] = None
     _anchor_info_dict: Dict[str, Dict[str, int]] = {}
     _global_anchor_info_dict: Dict[str, Dict[str, List[int]]] = {}
+    _radix_tree_dump_counters: Dict[str, int] = {}
+    _shared_model_name: Optional[str] = None
+    _shared_backend: str = "paged"
     # Align with non-paged backend: default greedy decoding.
     DEFAULT_TEMPERATURE = 0.0
 
@@ -114,8 +149,10 @@ class PagedLLMChat(LLM):
         model_name: str,
         prefix: str = None,
         config: Optional[KVCommConfig] = None,
+        paged_backend: str = "paged",
     ):
         self.model_name = model_name
+        self.paged_backend = paged_backend or "paged"
         self.config = (config or KVCommConfig.from_env()).validate()
         self._ensure_thread_pool(self.config.thread_pool_workers)
         self.lock = asyncio.Lock()
@@ -142,11 +179,31 @@ class PagedLLMChat(LLM):
     def _initialize_shared_resources(self):
         """Lazy-init nano-vllm engine, tokenizer, and PagedKVCOMMEngine."""
         with PagedLLMChat._model_lock:
-            if PagedLLMChat._shared_engine is None:
-                logger.info("Initializing nano-vllm engine for model: {}", self.model_name)
+            needs_reinit = (
+                PagedLLMChat._shared_engine is None
+                or PagedLLMChat._shared_model_name != self.model_name
+                or PagedLLMChat._shared_backend != self.paged_backend
+            )
+            if needs_reinit:
+                if PagedLLMChat._shared_engine is not None:
+                    try:
+                        PagedLLMChat._shared_engine.exit()
+                    except Exception:
+                        logger.exception("Failed to exit previous nano-vllm engine cleanly")
 
-                PagedLLMChat._shared_engine = LLMEngine(self.model_name)
+                logger.info(
+                    "Initializing nano-vllm engine for model: {} backend={}",
+                    self.model_name,
+                    self.paged_backend,
+                )
+
+                PagedLLMChat._shared_engine = LLMEngine(
+                    self.model_name,
+                    paged_backend=self.paged_backend,
+                )
                 PagedLLMChat._shared_tokenizer = PagedLLMChat._shared_engine.tokenizer
+                PagedLLMChat._shared_model_name = self.model_name
+                PagedLLMChat._shared_backend = self.paged_backend
 
                 # Extract KV cache and block manager from model_runner
                 model_runner = PagedLLMChat._shared_engine.model_runner
@@ -185,6 +242,73 @@ class PagedLLMChat(LLM):
                 cls._THREAD_POOL.shutdown(wait=False)
             cls._THREAD_POOL = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="PagedLLM")
             cls._THREAD_POOL_WORKERS = workers
+
+    @classmethod
+    def _next_radix_tree_dump_index(cls, root: Path) -> int:
+        key = str(root)
+        with _RADIX_TREE_DEBUG_IO_LOCK:
+            next_index = int(cls._radix_tree_dump_counters.get(key, 0)) + 1
+            cls._radix_tree_dump_counters[key] = next_index
+        return next_index
+
+    @classmethod
+    def dump_shared_radix_tree(
+        cls,
+        target: Optional[Union[str, Path]],
+        *,
+        label: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        token_preview: int = 16,
+    ) -> Optional[str]:
+        if cls._shared_backend != "radix":
+            return None
+        root = _resolve_radix_tree_debug_root(target)
+        if root is None:
+            return None
+
+        engine = cls._shared_engine
+        scheduler = getattr(engine, "scheduler", None) if engine is not None else None
+        block_manager = getattr(scheduler, "block_manager", None) if scheduler is not None else None
+
+        if label is None:
+            label = f"after_call_{cls._next_radix_tree_dump_index(root)}"
+
+        snapshot: Dict[str, Any] = {
+            "timestamp": time.time(),
+            "label": label,
+            "metadata": cls._json_ready(metadata or {}),
+            "scheduler_type": type(scheduler).__name__ if scheduler is not None else None,
+            "block_manager_type": type(block_manager).__name__ if block_manager is not None else None,
+        }
+        if block_manager is not None and hasattr(block_manager, "get_radix_tree_snapshot"):
+            snapshot["available"] = True
+            snapshot.update(
+                cls._json_ready(block_manager.get_radix_tree_snapshot(token_preview=token_preview))
+            )
+        else:
+            snapshot["available"] = False
+            snapshot["reason"] = "scheduler_has_no_radix_tree"
+
+        index_payload = {
+            "timestamp": snapshot["timestamp"],
+            "label": label,
+            "path": str(root / f"{label}.json"),
+            "available": snapshot["available"],
+            "scheduler_type": snapshot["scheduler_type"],
+            "block_manager_type": snapshot["block_manager_type"],
+            "node_count": snapshot.get("node_count"),
+            "leaf_count": snapshot.get("leaf_count"),
+            "metadata": snapshot["metadata"],
+        }
+
+        with _RADIX_TREE_DEBUG_IO_LOCK:
+            root.mkdir(parents=True, exist_ok=True)
+            with open(root / f"{label}.json", "w", encoding="utf-8") as handle:
+                json.dump(snapshot, handle, ensure_ascii=False, indent=2)
+            with open(root / "index.jsonl", "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(index_payload, ensure_ascii=False) + "\n")
+
+        return str(root / f"{label}.json")
 
     # ── Chat template helpers (same as LLMChat) ──
 
@@ -332,6 +456,282 @@ class PagedLLMChat(LLM):
             )
         return str(message)
 
+    def _resolve_request_message(self, messages: Any) -> Optional[str]:
+        if isinstance(messages, str):
+            return messages
+        normalised = self._normalise_messages(messages)
+        for item in reversed(normalised):
+            if item.get("role") == "user":
+                return item.get("content", "")
+        if normalised:
+            return normalised[-1].get("content", "")
+        return None
+
+    def _consume_pending_generation_context(self) -> Tuple[Optional[List[Dict[str, str]]], Dict[str, str]]:
+        node_id = getattr(self, "node_id", None)
+        if node_id is None:
+            return None, {}
+        memory = self._ensure_agent_memory(node_id)
+        pending_messages = memory.pop("pending_full_message", None)
+        placeholder_values = memory.pop("pending_placeholder_values", None) or {}
+        return pending_messages, placeholder_values
+
+    def _resolve_generation_payload(
+        self,
+        messages: Any,
+        request_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        pending_messages, placeholder_values = self._consume_pending_generation_context()
+        resolved_messages = self._normalise_messages(
+            pending_messages if pending_messages is not None else messages
+        )
+        resolved_request_message = request_message or self._resolve_request_message(messages)
+        if resolved_request_message and placeholder_values.get("user_question") is None:
+            placeholder_values["user_question"] = resolved_request_message
+        return {
+            "messages": resolved_messages,
+            "request_message": resolved_request_message,
+            "message_key_source": (
+                resolved_request_message if resolved_request_message is not None else messages
+            ),
+            "placeholder_values": {
+                key: value
+                for key, value in placeholder_values.items()
+                if isinstance(value, str) and value
+            },
+            "prompt_source": "pending_full_message" if pending_messages is not None else "call_input",
+        }
+
+    def _locate_runtime_placeholders(
+        self,
+        prompt_text: str,
+        placeholder_values: Dict[str, str],
+        stored_placeholder_info: Dict[str, List[int]],
+    ) -> Dict[str, List[int]]:
+        runtime_info: Dict[str, List[int]] = {}
+        if not prompt_text or not placeholder_values:
+            return runtime_info
+
+        for ph_id, value in placeholder_values.items():
+            if not value:
+                continue
+            occurrences: List[Tuple[int, int]] = []
+            start = prompt_text.find(value)
+            while start != -1:
+                end = start + len(value)
+                token_start = len(self._encode(prompt_text[:start]))
+                token_len = len(self._encode(value))
+                if token_len > 0:
+                    occurrences.append((token_start, token_start + token_len))
+                start = prompt_text.find(value, start + 1)
+
+            if not occurrences:
+                continue
+
+            target_start = stored_placeholder_info.get(ph_id, [occurrences[0][0], 0])[0]
+            best_start, best_end = min(
+                occurrences,
+                key=lambda span: abs(span[0] - target_start),
+            )
+            runtime_info[ph_id] = [best_start, best_end]
+
+        return dict(sorted(runtime_info.items(), key=lambda x: x[1][0], reverse=True))
+
+    @staticmethod
+    def _truncate_debug_text(text: Any, limit: int = 240) -> str:
+        if text is None:
+            return ""
+        value = str(text)
+        if len(value) <= limit:
+            return value
+        return value[:limit] + "..."
+
+    @staticmethod
+    def _token_block_span(start: int, end: int, block_size: int) -> List[int]:
+        start = max(0, int(start))
+        end = max(start, int(end))
+        start_block = start // block_size
+        if end <= start:
+            return [start_block, start_block]
+        return [start_block, ((end - 1) // block_size) + 1]
+
+    @staticmethod
+    def _block_slice_layout(start_token: int, num_tokens: int, block_size: int) -> Dict[str, int]:
+        start_token = max(0, int(start_token))
+        num_tokens = max(0, int(num_tokens))
+        start_block = start_token // block_size
+        end_token = start_token + num_tokens
+        end_block = start_block if num_tokens <= 0 else ((end_token - 1) // block_size) + 1
+        return {
+            "start_block": start_block,
+            "end_block": end_block,
+            "block_offset": start_token - start_block * block_size,
+            "num_tokens": num_tokens,
+        }
+
+    @staticmethod
+    def _prompt_block_count(prompt_num_tokens: int, block_size: int) -> int:
+        prompt_num_tokens = max(0, int(prompt_num_tokens))
+        block_size = max(1, int(block_size))
+        if prompt_num_tokens <= 0:
+            return 0
+        return ((prompt_num_tokens - 1) // block_size) + 1
+
+    @staticmethod
+    def _prompt_block_table_snapshot(
+        block_table: List[int],
+        prompt_num_tokens: int,
+        block_size: int,
+    ) -> List[int]:
+        prompt_block_count = PagedLLMChat._prompt_block_count(prompt_num_tokens, block_size)
+        return list(block_table[:prompt_block_count])
+
+    @staticmethod
+    def _slice_fits_block_capacity(
+        block_table: List[int],
+        start_offset: int,
+        num_tokens: int,
+        block_size: int,
+    ) -> bool:
+        return start_offset + num_tokens <= len(block_table) * block_size
+
+    @staticmethod
+    def _json_ready(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, dict):
+            return {str(k): PagedLLMChat._json_ready(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [PagedLLMChat._json_ready(v) for v in value]
+        if isinstance(value, set):
+            return sorted(PagedLLMChat._json_ready(v) for v in value)
+        return value
+
+    def _record_radix_debug(
+        self,
+        *,
+        output_dir: Optional[Union[str, Path]],
+        request_uid: Optional[str],
+        stage: str,
+        payload: Dict[str, Any],
+        agent_id: Optional[str] = None,
+        agent_name: Optional[str] = None,
+        agent_role: Optional[str] = None,
+    ) -> None:
+        if self.paged_backend != "radix":
+            return
+        root = _resolve_radix_debug_root(output_dir)
+        if root is None or not request_uid:
+            return
+
+        request_dir = root / "requests"
+        index_path = root / "index.jsonl"
+        summary_path = root / "summary.json"
+        request_path = request_dir / f"{request_uid}.json"
+        agent_id = str(agent_id or getattr(self, "node_id", "?"))
+        agent_name = agent_name or getattr(self, "agent_name", None) or self.__class__.__name__
+        agent_role = agent_role or getattr(self, "role", None)
+
+        event = {
+            "timestamp": time.time(),
+            "request_uid": request_uid,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "agent_role": agent_role,
+            "stage": stage,
+            "payload": self._json_ready(payload),
+        }
+
+        with _RADIX_DEBUG_IO_LOCK:
+            request_dir.mkdir(parents=True, exist_ok=True)
+            with open(index_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+            request_exists = request_path.exists()
+            request_data = _load_json_dict(request_path)
+            if not request_data:
+                request_data = {"request_uid": request_uid, "agents": {}}
+            if payload.get("request_message"):
+                request_data["task"] = payload.get("request_message")
+            request_data["last_stage"] = stage
+            request_data["last_timestamp"] = event["timestamp"]
+            agent_bucket = request_data.setdefault("agents", {}).setdefault(
+                agent_id,
+                {
+                    "agent_id": agent_id,
+                    "agent_name": agent_name,
+                    "agent_role": agent_role,
+                    "events": [],
+                },
+            )
+            agent_bucket["agent_name"] = agent_name
+            agent_bucket["agent_role"] = agent_role
+            agent_bucket.setdefault("events", []).append(event)
+            with open(request_path, "w", encoding="utf-8") as handle:
+                json.dump(request_data, handle, ensure_ascii=False, indent=2)
+
+            summary = _load_json_dict(summary_path)
+            if not summary:
+                summary = {
+                    "request_count": 0,
+                    "event_count": 0,
+                    "stage_counts": {},
+                    "fallback_reasons": {},
+                    "combined_blocks_mismatch_count": 0,
+                    "prompt_only_runtime_exceeds_template_count": 0,
+                    "agent_stats": {},
+                }
+            if not request_exists:
+                summary["request_count"] = int(summary.get("request_count", 0)) + 1
+            summary["event_count"] = int(summary.get("event_count", 0)) + 1
+            stage_counts = summary.setdefault("stage_counts", {})
+            stage_counts[stage] = int(stage_counts.get(stage, 0)) + 1
+
+            if stage == "generation_result":
+                agent_stats = summary.setdefault("agent_stats", {}).setdefault(
+                    agent_id,
+                    {
+                        "agent_id": agent_id,
+                        "agent_name": agent_name,
+                        "agent_role": agent_role,
+                        "calls": 0,
+                        "kv_reuse_calls": 0,
+                        "radix_hit_calls": 0,
+                        "applied_reuse_calls": 0,
+                        "effective_reuse_calls": 0,
+                        "prompt_only_runtime_exceeds_template_calls": 0,
+                    },
+                )
+                agent_stats["agent_name"] = agent_name
+                agent_stats["agent_role"] = agent_role
+                agent_stats["calls"] = int(agent_stats.get("calls", 0)) + 1
+                if payload.get("mode") == "kv_reuse":
+                    agent_stats["kv_reuse_calls"] = int(agent_stats.get("kv_reuse_calls", 0)) + 1
+                if int(payload.get("num_cached_tokens", 0) or 0) > 0:
+                    agent_stats["radix_hit_calls"] = int(agent_stats.get("radix_hit_calls", 0)) + 1
+                if payload.get("applied_reuse_hit"):
+                    agent_stats["applied_reuse_calls"] = int(agent_stats.get("applied_reuse_calls", 0)) + 1
+                if payload.get("effective_reuse_hit"):
+                    agent_stats["effective_reuse_calls"] = int(agent_stats.get("effective_reuse_calls", 0)) + 1
+                if payload.get("prompt_only_runtime_exceeds_template"):
+                    agent_stats["prompt_only_runtime_exceeds_template_calls"] = int(
+                        agent_stats.get("prompt_only_runtime_exceeds_template_calls", 0)
+                    ) + 1
+                    summary["prompt_only_runtime_exceeds_template_count"] = int(
+                        summary.get("prompt_only_runtime_exceeds_template_count", 0)
+                    ) + 1
+
+                fallback_reasons = summary.setdefault("fallback_reasons", {})
+                for reason, count in (payload.get("anchor_skip_reasons") or {}).items():
+                    fallback_reasons[reason] = int(fallback_reasons.get(reason, 0)) + int(count)
+                    if "combined_blocks_mismatch" in reason:
+                        summary["combined_blocks_mismatch_count"] = int(
+                            summary.get("combined_blocks_mismatch_count", 0)
+                        ) + int(count)
+
+            with open(summary_path, "w", encoding="utf-8") as handle:
+                json.dump(summary, handle, ensure_ascii=False, indent=2)
+
     # ── Agent identity ──
 
     def set_id(self, node_id: str, role: str):
@@ -382,33 +782,44 @@ class PagedLLMChat(LLM):
                     len(token_ids),
                 )
                 cached_prefix_num_tokens = normalized_cached_tokens
+        scheduler = self.engine.scheduler
+        scheduler_add_params = set(inspect.signature(scheduler.add).parameters)
+        supports_prefilled_add = "prefilled_block_table" in scheduler_add_params
+
         seq = Sequence(
             token_ids,
             sp,
-            prefilled_block_table=cached_prefix_block_table,
-            num_cached_tokens=cached_prefix_num_tokens,
+            prefilled_block_table=None if supports_prefilled_add else cached_prefix_block_table,
+            num_cached_tokens=0 if supports_prefilled_add else cached_prefix_num_tokens,
         )
 
         # Add to scheduler
-        scheduler = self.engine.scheduler
-        scheduler.add(seq)
+        if supports_prefilled_add and cached_prefix_block_table is not None:
+            scheduler.add(
+                seq,
+                prefilled_block_table=cached_prefix_block_table,
+                prefilled_num_cached=cached_prefix_num_tokens,
+            )
+        else:
+            scheduler.add(seq)
 
         ttft = None
-        prefill_latency = 0.0
         start_time = perf_counter()
         block_table_snapshot: List[int] = list(seq.block_table)
         num_tokens_snapshot: int = len(seq)
+        num_cached_tokens_snapshot: int = int(seq.num_cached_tokens)
+        prompt_block_count_snapshot: int = self._prompt_block_count(
+            len(token_ids), self.paged_kv_engine.block_size
+        )
+        prompt_block_table_snapshot: List[int] = self._prompt_block_table_snapshot(
+            block_table_snapshot,
+            len(token_ids),
+            self.paged_kv_engine.block_size,
+        )
         pinned_block_table: List[int] = []
 
         while not seq.is_finished:
             seqs, is_prefill = scheduler.schedule()
-
-            # Capture prefill end time right before the first decode forward pass
-            if prefill_latency == 0.0 and not is_prefill:
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                prefill_latency = perf_counter() - start_time
-
             token_ids_out = self.engine.model_runner.call("run", seqs, is_prefill)
             # Pin the terminal step blocks before scheduler.postprocess deallocates seq.
             for sched_seq, token_id in zip(seqs, token_ids_out):
@@ -424,9 +835,17 @@ class PagedLLMChat(LLM):
             # Keep a copy before postprocess potentially frees sequence blocks.
             block_table_snapshot = list(seq.block_table)
             num_tokens_snapshot = len(seq)
+            num_cached_tokens_snapshot = max(
+                num_cached_tokens_snapshot,
+                int(seq.num_cached_tokens),
+            )
+            prompt_block_table_snapshot = self._prompt_block_table_snapshot(
+                block_table_snapshot,
+                len(token_ids),
+                self.paged_kv_engine.block_size,
+            )
             scheduler.postprocess(seqs, token_ids_out)
 
-            # Capture TTFT after the first decode forward pass completes
             if ttft is None and not is_prefill:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -437,12 +856,15 @@ class PagedLLMChat(LLM):
 
         # Persist snapshots for callers that need KV block ranges after generation.
         setattr(seq, "_block_table_snapshot", block_table_snapshot)
+        setattr(seq, "_prompt_block_table_snapshot", prompt_block_table_snapshot)
+        setattr(seq, "_prompt_block_count_snapshot", prompt_block_count_snapshot)
         setattr(seq, "_num_tokens_snapshot", num_tokens_snapshot)
+        setattr(seq, "_num_cached_tokens_snapshot", num_cached_tokens_snapshot)
         setattr(seq, "_pinned_block_table", pinned_block_table)
 
-        return seq.completion_token_ids, ttft, prefill_latency, seq
+        return seq.completion_token_ids, ttft, seq
 
-    def _prepare_kv_reuse_prefix_blocks(
+    def _prepare_kv_reuse_prefix_blocks_legacy(
         self,
         *,
         prefix_store: Dict[str, Any],
@@ -450,19 +872,31 @@ class PagedLLMChat(LLM):
         prompt_num_tokens: int,
         message_key: str,
     ) -> Tuple[Optional[List[int]], int, Dict[str, Any]]:
-        """Build pre-injected cached prefix blocks for kv_reuse mode.
-
-        Returns (block_table, cached_tokens, stats).
-        """
+        """Original PagedKVCOMM offset path preserved for the paged backend."""
         stats: Dict[str, Any] = {
             "anchor_candidates": 0,
             "offset_calls": 0,
             "offset_effective": 0,
             "offset_applied": False,
             "fallback_reason": None,
+            "selected_placeholder_id": None,
+            "pre_token_span": None,
+            "placeholder_token_span": None,
+            "suffix_token_span": None,
+            "pre_block_span": None,
+            "placeholder_block_span": None,
+            "suffix_block_span": None,
+            "base_block_table_len": 0,
+            "base_ph_blocks_len": 0,
+            "base_pf_blocks_len": 0,
+            "new_ph_blocks_len": 0,
+            "new_pf_blocks_len": 0,
+            "expected_blocks": 0,
+            "combined_blocks": 0,
         }
 
         base_block_table = list(prefix_store.get("prefix_block_table", []) or [])
+        stats["base_block_table_len"] = len(base_block_table)
         if not base_block_table:
             stats["fallback_reason"] = "no_prefix_block_table"
             return None, 0, stats
@@ -470,9 +904,6 @@ class PagedLLMChat(LLM):
             stats["fallback_reason"] = "no_placeholder_info"
             return None, 0, stats
 
-        # We offset one effective placeholder span per request. For multi-placeholder
-        # prompts, prefer user_question if available, otherwise choose the last valid
-        # placeholder by position (closest to generation tail).
         valid_ph_items = [
             (ph_id, span)
             for ph_id, span in sorted(placeholder_info.items(), key=lambda x: x[1][0])
@@ -488,6 +919,7 @@ class PagedLLMChat(LLM):
         else:
             ph_id, (ph_start, ph_end) = valid_ph_items[-1]
         anchor_messages = list(self.paged_kv_engine.anchors.get(ph_id, {}).keys())
+        stats["selected_placeholder_id"] = ph_id
         stats["anchor_candidates"] = len(anchor_messages)
         if not anchor_messages:
             stats["fallback_reason"] = "no_anchor_messages"
@@ -498,6 +930,12 @@ class PagedLLMChat(LLM):
         ph_end_block = (ph_end - 1) // bs + 1
         pf_start = ph_end
         pf_end = prompt_num_tokens
+
+        stats["pre_token_span"] = [0, ph_start]
+        stats["placeholder_token_span"] = [ph_start, ph_end]
+        stats["suffix_token_span"] = [pf_start, prompt_num_tokens]
+        stats["pre_block_span"] = [0, ph_start_block]
+        stats["placeholder_block_span"] = [ph_start_block, ph_end_block]
 
         if ph_start_block >= len(base_block_table):
             stats["fallback_reason"] = "placeholder_out_of_base_range"
@@ -510,8 +948,13 @@ class PagedLLMChat(LLM):
             pf_start_block = pf_start // bs
             pf_end_block = (pf_end - 1) // bs + 1
             base_pf_blocks = base_block_table[pf_start_block:pf_end_block]
+            stats["suffix_block_span"] = [pf_start_block, pf_end_block]
         else:
             base_pf_blocks = []
+            stats["suffix_block_span"] = [pf_start // bs, pf_start // bs]
+
+        stats["base_ph_blocks_len"] = len(base_ph_blocks)
+        stats["base_pf_blocks_len"] = len(base_pf_blocks)
 
         if ph_num <= 0 or not base_ph_blocks:
             stats["fallback_reason"] = "invalid_placeholder_block_span"
@@ -530,30 +973,24 @@ class PagedLLMChat(LLM):
             temperature=1.0,
         )
 
+        stats["new_ph_blocks_len"] = len(new_ph_blocks)
+        stats["new_pf_blocks_len"] = len(new_pf_blocks)
         if new_ph_blocks != base_ph_blocks or new_pf_blocks != base_pf_blocks:
             stats["offset_effective"] += 1
 
-        # Stitch full prompt prefix blocks: [before placeholder] + [offset placeholder] + [offset tail].
         pre_blocks = base_block_table[:ph_start_block]
         if pre_blocks:
             self.paged_kv_engine.increment_ref(pre_blocks)
 
         combined_blocks = pre_blocks + list(new_ph_blocks) + list(new_pf_blocks)
         expected_blocks = (prompt_num_tokens + bs - 1) // bs
+        stats["expected_blocks"] = expected_blocks
+        stats["combined_blocks"] = len(combined_blocks)
         if len(combined_blocks) != expected_blocks:
             if pre_blocks:
                 self.paged_kv_engine.free_blocks(pre_blocks)
-
-            # If offset returned base blocks (no-op), free only our temporary refs.
-            if new_ph_blocks == base_ph_blocks:
-                self.paged_kv_engine.free_blocks(new_ph_blocks)
-            else:
-                self.paged_kv_engine.free_blocks(new_ph_blocks)
-            if new_pf_blocks == base_pf_blocks:
-                self.paged_kv_engine.free_blocks(new_pf_blocks)
-            else:
-                self.paged_kv_engine.free_blocks(new_pf_blocks)
-
+            self.paged_kv_engine.free_blocks(list(new_ph_blocks))
+            self.paged_kv_engine.free_blocks(list(new_pf_blocks))
             stats["fallback_reason"] = (
                 f"combined_blocks_mismatch:{len(combined_blocks)}!={expected_blocks}"
             )
@@ -562,9 +999,249 @@ class PagedLLMChat(LLM):
         stats["offset_applied"] = True
         return combined_blocks, prompt_num_tokens, stats
 
+    def _prepare_kv_reuse_prefix_blocks(
+        self,
+        *,
+        prefix_store: Dict[str, Any],
+        placeholder_info: Dict[str, List[int]],
+        prompt_num_tokens: int,
+        message_key: str,
+    ) -> Tuple[Optional[List[int]], int, Dict[str, Any]]:
+        """Build pre-injected cached prefix blocks for kv_reuse mode.
+
+        Returns (block_table, cached_tokens, stats).
+        """
+        if self.paged_backend != "radix":
+            return self._prepare_kv_reuse_prefix_blocks_legacy(
+                prefix_store=prefix_store,
+                placeholder_info=placeholder_info,
+                prompt_num_tokens=prompt_num_tokens,
+                message_key=message_key,
+            )
+
+        stats: Dict[str, Any] = {
+            "anchor_candidates": 0,
+            "offset_calls": 0,
+            "offset_effective": 0,
+            "offset_applied": False,
+            "fallback_reason": None,
+            "selected_placeholder_id": None,
+            "pre_token_span": None,
+            "placeholder_token_span": None,
+            "suffix_token_span": None,
+            "pre_block_span": None,
+            "placeholder_block_span": None,
+            "suffix_block_span": None,
+            "base_block_table_len": 0,
+            "base_ph_blocks_len": 0,
+            "base_pf_blocks_len": 0,
+            "new_ph_blocks_len": 0,
+            "new_pf_blocks_len": 0,
+            "expected_blocks": 0,
+            "combined_blocks": 0,
+        }
+
+        base_block_table = list(prefix_store.get("prefix_block_table", []) or [])
+        stats["base_block_table_len"] = len(base_block_table)
+        if not base_block_table:
+            stats["fallback_reason"] = "no_prefix_block_table"
+            return None, 0, stats
+        if not placeholder_info:
+            stats["fallback_reason"] = "no_placeholder_info"
+            return None, 0, stats
+
+        stored_placeholder_info = prefix_store.get("placeholder_info", {}) or {}
+        runtime_span = placeholder_info.get("user_question")
+        template_span = stored_placeholder_info.get("user_question")
+        if not runtime_span:
+            legacy_blocks, legacy_tokens, legacy_stats = self._prepare_kv_reuse_prefix_blocks_legacy(
+                prefix_store=prefix_store,
+                placeholder_info=placeholder_info,
+                prompt_num_tokens=prompt_num_tokens,
+                message_key=message_key,
+            )
+            legacy_stats["fallback_reason"] = legacy_stats.get("fallback_reason") or "no_user_question_placeholder"
+            return legacy_blocks, legacy_tokens, legacy_stats
+        if not template_span:
+            legacy_blocks, legacy_tokens, legacy_stats = self._prepare_kv_reuse_prefix_blocks_legacy(
+                prefix_store=prefix_store,
+                placeholder_info=placeholder_info,
+                prompt_num_tokens=prompt_num_tokens,
+                message_key=message_key,
+            )
+            legacy_stats["fallback_reason"] = legacy_stats.get("fallback_reason") or "no_template_user_question_placeholder"
+            return legacy_blocks, legacy_tokens, legacy_stats
+
+        ph_id = "user_question"
+        ph_start, ph_end = runtime_span
+        if ph_start < 0 or ph_end <= ph_start or ph_end > prompt_num_tokens:
+            stats["fallback_reason"] = "no_valid_user_question_span"
+            return None, 0, stats
+
+        bs = self.paged_kv_engine.block_size
+        expected_blocks = (prompt_num_tokens + bs - 1) // bs
+        stats["expected_blocks"] = expected_blocks
+        if expected_blocks > len(base_block_table):
+            stats["fallback_reason"] = "runtime_prompt_exceeds_template_blocks"
+            return None, 0, stats
+
+        anchor_messages = list(self.paged_kv_engine.anchors.get(ph_id, {}).keys())
+        stats["selected_placeholder_id"] = ph_id
+        stats["anchor_candidates"] = len(anchor_messages)
+        if not anchor_messages:
+            stats["fallback_reason"] = "no_anchor_messages"
+            return None, 0, stats
+
+        runtime_ph = self._block_slice_layout(ph_start, ph_end - ph_start, bs)
+        pf_start = ph_end
+        pf_num = max(0, prompt_num_tokens - pf_start)
+        runtime_pf = self._block_slice_layout(pf_start, pf_num, bs)
+        base_ph_start, base_ph_end = template_span
+        base_pf_start = base_ph_end
+        base_ph = self._block_slice_layout(base_ph_start, runtime_ph["num_tokens"], bs)
+        base_pf = self._block_slice_layout(base_pf_start, runtime_pf["num_tokens"], bs)
+
+        stats["pre_token_span"] = [0, ph_start]
+        stats["placeholder_token_span"] = [ph_start, ph_end]
+        stats["suffix_token_span"] = [pf_start, prompt_num_tokens]
+        stats["pre_block_span"] = [0, runtime_ph["start_block"]]
+        stats["placeholder_block_span"] = [runtime_ph["start_block"], runtime_ph["end_block"]]
+        stats["suffix_block_span"] = [runtime_pf["start_block"], runtime_pf["end_block"]]
+
+        if runtime_ph["start_block"] >= len(base_block_table):
+            stats["fallback_reason"] = "placeholder_out_of_base_range"
+            return None, 0, stats
+
+        pre_blocks = base_block_table[:runtime_ph["start_block"]]
+        base_tail_block_table = base_block_table[runtime_ph["start_block"]:]
+        base_tail_num_tokens = int(prefix_store.get("prefix_num_tokens", 0)) - runtime_ph["start_block"] * bs
+        base_pre_num_tokens = ph_start - runtime_ph["start_block"] * bs
+        if base_tail_num_tokens <= 0 or base_pre_num_tokens < 0:
+            stats["fallback_reason"] = "invalid_base_tail_span"
+            return None, 0, stats
+
+        base_ph_blocks = base_block_table[base_ph["start_block"]:base_ph["end_block"]]
+        base_pf_blocks = base_block_table[base_pf["start_block"]:base_pf["end_block"]]
+        stats["base_ph_blocks_len"] = len(base_ph_blocks)
+        stats["base_pf_blocks_len"] = len(base_pf_blocks)
+        if not base_ph_blocks:
+            stats["fallback_reason"] = "base_blocks_out_of_range"
+            return None, 0, stats
+        if runtime_pf["num_tokens"] > 0 and not base_pf_blocks:
+            stats["fallback_reason"] = "base_prefix_blocks_out_of_range"
+            return None, 0, stats
+        if not self._slice_fits_block_capacity(
+            base_ph_blocks,
+            base_ph["block_offset"],
+            runtime_ph["num_tokens"],
+            bs,
+        ):
+            stats["fallback_reason"] = "runtime_span_exceeds_template_blocks"
+            return None, 0, stats
+        if runtime_pf["num_tokens"] > 0 and not self._slice_fits_block_capacity(
+            base_pf_blocks,
+            base_pf["block_offset"],
+            runtime_pf["num_tokens"],
+            bs,
+        ):
+            stats["fallback_reason"] = "runtime_prompt_exceeds_template_blocks"
+            return None, 0, stats
+
+        input_entries = self._shared_kv_cache_memory.get("input_blocks", {}).get(message_key, [])
+        if not input_entries:
+            legacy_blocks, legacy_tokens, legacy_stats = self._prepare_kv_reuse_prefix_blocks_legacy(
+                prefix_store=prefix_store,
+                placeholder_info=placeholder_info,
+                prompt_num_tokens=prompt_num_tokens,
+                message_key=message_key,
+            )
+            legacy_stats["fallback_reason"] = legacy_stats.get("fallback_reason") or "no_query_input_blocks"
+            return legacy_blocks, legacy_tokens, legacy_stats
+        input_entry = input_entries[-1]
+        query_block_table = list(input_entry.get("block_table", []) or [])
+        query_num_tokens = int(input_entry.get("num_tokens", 0) or 0)
+        query_drop_num = int(input_entry.get("drop_num", 0) or 0)
+        query_start_block = query_drop_num // bs
+        query_block_offset = query_drop_num - query_start_block * bs
+        query_blocks = query_block_table[query_start_block:]
+        query_num_tokens = max(0, query_num_tokens - query_drop_num)
+        if not query_blocks or query_num_tokens <= 0:
+            legacy_blocks, legacy_tokens, legacy_stats = self._prepare_kv_reuse_prefix_blocks_legacy(
+                prefix_store=prefix_store,
+                placeholder_info=placeholder_info,
+                prompt_num_tokens=prompt_num_tokens,
+                message_key=message_key,
+            )
+            legacy_stats["fallback_reason"] = legacy_stats.get("fallback_reason") or "invalid_query_input_blocks"
+            return legacy_blocks, legacy_tokens, legacy_stats
+
+        stats["offset_calls"] += 1
+        if pre_blocks:
+            self.paged_kv_engine.increment_ref(pre_blocks)
+        new_tail_blocks, new_tail_num_tokens = self.paged_kv_engine.offset_kv_cache_tail(
+            agent_id=self.node_id,
+            ph_id=ph_id,
+            message=message_key,
+            base_tail_block_table=base_tail_block_table,
+            base_tail_num_tokens=base_tail_num_tokens,
+            base_pre_num_tokens=base_pre_num_tokens,
+            base_ph_block_table=base_ph_blocks,
+            base_ph_num_tokens=runtime_ph["num_tokens"],
+            base_ph_block_offset=base_ph["block_offset"],
+            base_pf_block_table=base_pf_blocks,
+            base_pf_num_tokens=runtime_pf["num_tokens"],
+            base_pf_block_offset=base_pf["block_offset"],
+            runtime_ph_num_tokens=runtime_ph["num_tokens"],
+            runtime_pf_num_tokens=runtime_pf["num_tokens"],
+            query_block_table=query_blocks,
+            query_num_tokens=query_num_tokens,
+            query_block_offset=query_block_offset,
+            anchor_list=anchor_messages,
+            temperature=1.0,
+        )
+        if not new_tail_blocks or new_tail_num_tokens <= 0:
+            if pre_blocks:
+                self.paged_kv_engine.free_blocks(pre_blocks)
+            stats["fallback_reason"] = "no_valid_anchor_deltas"
+            return None, 0, stats
+
+        combined_blocks = pre_blocks + list(new_tail_blocks)
+        stats["new_ph_blocks_len"] = len(new_tail_blocks)
+        stats["new_pf_blocks_len"] = 0
+        stats["combined_blocks"] = len(combined_blocks)
+        if len(combined_blocks) != expected_blocks:
+            if pre_blocks:
+                self.paged_kv_engine.free_blocks(pre_blocks)
+            self.paged_kv_engine.free_blocks(list(new_tail_blocks))
+            stats["fallback_reason"] = (
+                f"combined_blocks_mismatch:{len(combined_blocks)}!={expected_blocks}"
+            )
+            return None, 0, stats
+
+        stats["offset_effective"] = 1
+        stats["offset_applied"] = True
+        actual_cached_tokens = min(
+            prompt_num_tokens,
+            runtime_ph["start_block"] * bs + new_tail_num_tokens,
+        )
+        logger.info(
+            "[KV_REUSE_CACHED] node={} actual_cached={} prompt_tokens={} ph=[{},{}] pf=[{},{}]",
+            getattr(self, "node_id", "?"), actual_cached_tokens, prompt_num_tokens,
+            ph_start, ph_end, pf_start, pf_start + runtime_pf["num_tokens"],
+        )
+        return combined_blocks, actual_cached_tokens, stats
+
     # ── Prefix preparation (paged version) ──
 
-    async def prepare_prefix_kv_segments(self, node_id: str, prefix: str, user_prompt: str):
+    async def prepare_prefix_kv_segments(
+        self,
+        node_id: str,
+        prefix: str,
+        user_prompt: str,
+        *,
+        request_uid: Optional[str] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+    ):
         """Materialize prefix KV into blocks and store block tables.
 
         Unlike LLMChat which stores DynamicCache objects, we:
@@ -627,6 +1304,39 @@ class PagedLLMChat(LLM):
 
         PagedLLMChat._initialization[node_id] = True
 
+        bs = self.paged_kv_engine.block_size
+        segment_debug = []
+        for type_, text, token_ids, start_token, end_token in segments:
+            block_span = self._token_block_span(start_token, end_token, bs)
+            segment_debug.append(
+                {
+                    "type": type_,
+                    "label": text if type_ == "placeholder" else self._truncate_debug_text(text, 160),
+                    "token_span": [start_token, end_token],
+                    "token_count": len(token_ids),
+                    "block_span": block_span,
+                    "block_count": max(0, block_span[1] - block_span[0]),
+                }
+            )
+        self._record_radix_debug(
+            output_dir=output_dir,
+            request_uid=request_uid,
+            stage="prepare_prefix",
+            agent_id=node_id,
+            agent_role=getattr(self, "role", None),
+            payload={
+                "request_message": user_prompt,
+                "system_prompt": prefix,
+                "user_prompt": user_prompt,
+                "prompt_text": prompt_text,
+                "prompt_tokens": len(full_token_ids),
+                "placeholder_info": placeholder_info,
+                "prefix_block_table_len": len(full_block_table),
+                "prefix_num_tokens": full_num_tokens,
+                "segments": segment_debug,
+            },
+        )
+
     def _locate_placeholder(self, original_text: str):
         """Locate placeholder spans in prompt. Returns (placeholder_info, segments)."""
         pattern = r'\{((?:agent|condition)_\w+_(?:current|history)|user_question)\}'
@@ -680,7 +1390,7 @@ class PagedLLMChat(LLM):
         if temperature is None:
             temperature = self.DEFAULT_TEMPERATURE
 
-        completion_ids, *_ = self._generate_tokens(token_ids, max_tokens, temperature)
+        completion_ids, ttft, seq = self._generate_tokens(token_ids, max_tokens, temperature)
         return self.tokenizer.decode(completion_ids, skip_special_tokens=True)
 
     async def agen(
@@ -694,6 +1404,8 @@ class PagedLLMChat(LLM):
         agent_id: Optional[str] = None,
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+        radix_debug_output_dir: Optional[Union[str, Path]] = None,
     ) -> GenerationResult:
         """Async generation through nano-vllm engine."""
         async with self.lock:
@@ -703,6 +1415,9 @@ class PagedLLMChat(LLM):
 
             prompt_text = self._build_prompt_text(messages)
             token_ids = self._encode(prompt_text)
+            prompt_num_tokens = len(token_ids)
+            request_message = self._resolve_request_message(messages)
+            prompt_source = "call_input"
 
             safe_prompt = _escape_loguru_markup(prompt_text)
             logger.opt(colors=True).debug(
@@ -712,7 +1427,32 @@ class PagedLLMChat(LLM):
                 safe_prompt,
             )
 
-            completion_ids, ttft, _prefill_lat, seq = self._generate_tokens(token_ids, max_tokens, temperature)
+            completion_ids, ttft, seq = self._generate_tokens(token_ids, max_tokens, temperature)
+            block_table = list(getattr(seq, "_block_table_snapshot", list(seq.block_table)))
+            prompt_block_table = list(
+                getattr(
+                    seq,
+                    "_prompt_block_table_snapshot",
+                    self._prompt_block_table_snapshot(
+                        block_table,
+                        prompt_num_tokens,
+                        self.paged_kv_engine.block_size,
+                    ),
+                )
+            )
+            prompt_block_count = int(
+                getattr(seq, "_prompt_block_count_snapshot", len(prompt_block_table))
+            )
+            full_block_count = len(block_table)
+            num_cached_tokens = int(
+                getattr(seq, "_num_cached_tokens_snapshot", getattr(seq, "num_cached_tokens", 0))
+            )
+            cached_block_count = num_cached_tokens // self.paged_kv_engine.block_size
+
+            # Free pinned blocks that _generate_tokens incremented for snapshot
+            pinned = getattr(seq, "_pinned_block_table", [])
+            if pinned:
+                self.paged_kv_engine.free_blocks(pinned)
             response_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
 
             safe_resp = _escape_loguru_markup(response_text)
@@ -723,14 +1463,99 @@ class PagedLLMChat(LLM):
                 safe_resp,
             )
 
-            metadata: Dict[str, Any] = {}
+            tree_snapshot_file = self.dump_shared_radix_tree(
+                radix_debug_output_dir,
+                metadata={
+                    "request_uid": request_uid,
+                    "agent_id": agent_id,
+                    "agent_name": agent_name,
+                    "agent_role": agent_role,
+                    "mode": "paged",
+                    "prompt_tokens": prompt_num_tokens,
+                    "num_cached_tokens": num_cached_tokens,
+                },
+            )
+            reuse_stats: Dict[str, Any] = {
+                "prompt_tokens": prompt_num_tokens,
+                "prompt_block_count": prompt_block_count,
+                "full_block_count": full_block_count,
+                "num_blocks": full_block_count,
+                "num_cached_tokens": num_cached_tokens,
+                "cached_block_count": cached_block_count,
+                "anchor_candidates": 0,
+                "offset_calls": 0,
+                "offset_effective": 0,
+                "offset_applied": False,
+                "applied_reuse_hit": bool(num_cached_tokens > 0),
+                "effective_reuse_hit": bool(num_cached_tokens > 0),
+                "anchor_set_count": 0,
+                "anchor_skip_reasons": {},
+                "tree_snapshot_file": tree_snapshot_file,
+            }
+
+            metadata: Dict[str, Any] = {
+                "reuse_stats": reuse_stats,
+                "prompt_source": prompt_source,
+                "prompt_tokens": prompt_num_tokens,
+                "prompt_block_count": prompt_block_count,
+                "full_block_count": full_block_count,
+                "input_messages": self._normalise_messages(messages),
+                "prompt_text": prompt_text,
+                "tree_snapshot_file": tree_snapshot_file,
+            }
             if request_uid:
                 metadata["request_uid"] = request_uid
             if agent_id:
                 metadata["agent_id"] = agent_id
+            if agent_name:
+                metadata["agent_name"] = agent_name
+            if agent_role:
+                metadata["agent_role"] = agent_role
             if return_cache:
                 metadata["block_table"] = list(seq.block_table)
                 metadata["num_tokens"] = len(seq)
+
+            _append_latency_record(output_dir, {
+                "timestamp": time.time(),
+                "mode": "paged",
+                "ttft": float(ttft),
+                "request_uid": request_uid,
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "agent_role": agent_role,
+                "request_message": request_message,
+                "prompt_source": prompt_source,
+                "prompt_tokens": prompt_num_tokens,
+                "prompt_block_count": prompt_block_count,
+                "full_block_count": full_block_count,
+                "num_blocks": full_block_count,
+                "num_cached_tokens": num_cached_tokens,
+                "cached_block_count": cached_block_count,
+                "tree_snapshot_file": tree_snapshot_file,
+            })
+
+            self._record_radix_debug(
+                output_dir=radix_debug_output_dir,
+                request_uid=request_uid,
+                stage="generation_result",
+                agent_id=agent_id,
+                agent_name=agent_name,
+                agent_role=agent_role,
+                payload={
+                    "request_message": request_message,
+                    "mode": "paged",
+                    "prompt_source": prompt_source,
+                    "prompt_tokens": prompt_num_tokens,
+                    "prompt_block_count": prompt_block_count,
+                    "full_block_count": full_block_count,
+                    "num_cached_tokens": num_cached_tokens,
+                    "applied_reuse_hit": bool(num_cached_tokens > 0),
+                    "effective_reuse_hit": bool(num_cached_tokens > 0),
+                    "prompt_only_runtime_exceeds_template": False,
+                    "anchor_skip_reasons": {},
+                    "tree_snapshot_file": tree_snapshot_file,
+                },
+            )
 
             return GenerationResult(
                 text=response_text,
@@ -751,24 +1576,34 @@ class PagedLLMChat(LLM):
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        radix_debug_output_dir: Optional[Union[str, Path]] = None,
         **kwargs: Any,
     ) -> GenerationResult:
         """Generate using the requested strategy with paged attention."""
+        resolved_payload = self._resolve_generation_payload(
+            message,
+            request_message=message,
+        )
         anchor_forces_dense = self.has_active_anchor(request_uid, message)
-        selected_mode = "dense_prefill" if (preferred_mode == "dense_prefill" or anchor_forces_dense) else "kv_reuse"
+        selected_mode = (
+            "dense_prefill"
+            if (preferred_mode == "dense_prefill" or anchor_forces_dense)
+            else "kv_reuse"
+        )
         logger.info(
             "[MODE_DECISION:paged] node={} role={} request_uid={} preferred_mode={} "
-            "anchor_forces_dense={} selected_mode={}",
+            "anchor_forces_dense={} selected_mode={} prompt_source={}",
             getattr(self, "node_id", "?"),
             getattr(self, "role", "?"),
             request_uid,
             preferred_mode,
             anchor_forces_dense,
             selected_mode,
+            resolved_payload["prompt_source"],
         )
         if selected_mode == "dense_prefill":
             return await self.generate_with_dense_prefill(
-                message,
+                resolved_payload["messages"],
                 max_tokens=max_tokens,
                 temperature=temperature,
                 request_uid=request_uid,
@@ -776,10 +1611,14 @@ class PagedLLMChat(LLM):
                 agent_name=agent_name,
                 agent_role=agent_role,
                 output_dir=output_dir,
+                radix_debug_output_dir=radix_debug_output_dir,
+                request_message=message,
+                prompt_source=resolved_payload["prompt_source"],
+                placeholder_values=resolved_payload["placeholder_values"],
                 **kwargs,
             )
         return await self.generate_with_kv_reuse(
-            message,
+            resolved_payload["messages"],
             max_tokens=max_tokens,
             temperature=temperature,
             request_uid=request_uid,
@@ -787,6 +1626,10 @@ class PagedLLMChat(LLM):
             agent_name=agent_name,
             agent_role=agent_role,
             output_dir=output_dir,
+            radix_debug_output_dir=radix_debug_output_dir,
+            request_message=message,
+            prompt_source=resolved_payload["prompt_source"],
+            placeholder_values=resolved_payload["placeholder_values"],
             **kwargs,
         )
 
@@ -800,6 +1643,10 @@ class PagedLLMChat(LLM):
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        radix_debug_output_dir: Optional[Union[str, Path]] = None,
+        request_message: Optional[str] = None,
+        prompt_source: str = "call_input",
+        placeholder_values: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> GenerationResult:
         """Generate by reusing prefix KV blocks (fast path).
@@ -821,13 +1668,21 @@ class PagedLLMChat(LLM):
                 agent_name=agent_name,
                 agent_role=agent_role,
                 output_dir=output_dir,
+                request_message=request_message,
+                prompt_source=prompt_source,
+                placeholder_values=placeholder_values,
             )
         return await self._generate_paged(
             messages, "kv_reuse",
             max_tokens=max_tokens, temperature=temperature,
             request_uid=request_uid, agent_id=agent_id,
             agent_name=agent_name, agent_role=agent_role,
-            output_dir=output_dir, **kwargs,
+            output_dir=output_dir,
+            radix_debug_output_dir=radix_debug_output_dir,
+            request_message=request_message,
+            prompt_source=prompt_source,
+            placeholder_values=placeholder_values,
+            **kwargs,
         )
 
     async def generate_with_dense_prefill(
@@ -840,6 +1695,10 @@ class PagedLLMChat(LLM):
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        radix_debug_output_dir: Optional[Union[str, Path]] = None,
+        request_message: Optional[str] = None,
+        prompt_source: str = "call_input",
+        placeholder_values: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> GenerationResult:
         """Generate with fresh prefix computation and anchor update."""
@@ -848,7 +1707,12 @@ class PagedLLMChat(LLM):
             max_tokens=max_tokens, temperature=temperature,
             request_uid=request_uid, agent_id=agent_id,
             agent_name=agent_name, agent_role=agent_role,
-            output_dir=output_dir, **kwargs,
+            output_dir=output_dir,
+            radix_debug_output_dir=radix_debug_output_dir,
+            request_message=request_message,
+            prompt_source=prompt_source,
+            placeholder_values=placeholder_values,
+            **kwargs,
         )
 
     async def _generate_paged(
@@ -862,6 +1726,10 @@ class PagedLLMChat(LLM):
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        radix_debug_output_dir: Optional[Union[str, Path]] = None,
+        request_message: Optional[str] = None,
+        prompt_source: str = "call_input",
+        placeholder_values: Optional[Dict[str, str]] = None,
         **kwargs,
     ) -> GenerationResult:
         """Core paged generation for both kv_reuse and dense_prefill modes.
@@ -893,19 +1761,27 @@ class PagedLLMChat(LLM):
                 max_tokens,
                 temperature,
             )
-            preprocess_start = perf_counter() if mode == "kv_reuse" else None
+            preprocess_start = perf_counter()
 
-            message = messages[0] if isinstance(messages, list) else messages
-            message_key = self._message_cache_key(message)
+            resolved_messages = self._normalise_messages(messages)
+            message_key_source = (
+                request_message if request_message is not None else messages
+            )
+            message_key = self._message_cache_key(message_key_source)
             reuse_stats: Dict[str, Any] = {
                 "mode": mode,
                 "placeholder_count": 0,
                 "anchor_candidates": 0,
                 "offset_calls": 0,
                 "offset_effective": 0,
+                "offset_applied": False,
+                "applied_reuse_hit": False,
+                "effective_reuse_hit": False,
                 "num_cached_tokens": 0,
                 "num_blocks": 0,
                 "anchor_set_count": 0,
+                "prompt_tokens": 0,
+                "prompt_source": prompt_source,
                 "anchor_skip_reasons": {},
             }
 
@@ -917,26 +1793,43 @@ class PagedLLMChat(LLM):
             prefix_store = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
             stored_placeholder_info = prefix_store.get("placeholder_info", {})
 
-            prompt_text = self._build_prompt_text(message)
+            prompt_text = self._build_prompt_text(resolved_messages)
             token_ids = self._encode(prompt_text)
+            reuse_stats["prompt_tokens"] = len(token_ids)
             dynamic_placeholder_info, _ = self._locate_placeholder(prompt_text)
+            runtime_placeholder_info = self._locate_runtime_placeholders(
+                prompt_text,
+                placeholder_values or {},
+                stored_placeholder_info,
+            )
 
             # kv_reuse should use runtime-aligned spans when available.
             placeholder_info_for_reuse = dict(stored_placeholder_info)
+            if runtime_placeholder_info:
+                placeholder_info_for_reuse.update(runtime_placeholder_info)
             uq_bucket = PagedLLMChat._global_anchor_info_dict.get("user_question", {})
-            uq_meta = uq_bucket.get(message_key, uq_bucket.get(message))
+            request_lookup_value = request_message if request_message is not None else message_key_source
+            uq_meta = uq_bucket.get(message_key, uq_bucket.get(request_lookup_value))
             reuse_span_source = "template"
-            if isinstance(uq_meta, (list, tuple)) and len(uq_meta) >= 2:
+            if "user_question" in runtime_placeholder_info:
+                reuse_span_source = "runtime_placeholder_value"
+            elif isinstance(uq_meta, (list, tuple)) and len(uq_meta) >= 2:
                 try:
                     uq_num_tokens = int(uq_meta[1])
                 except (TypeError, ValueError):
                     uq_num_tokens = 0
                 if 0 < uq_num_tokens <= len(token_ids):
-                    uq_start = len(token_ids) - uq_num_tokens
-                    placeholder_info_for_reuse["user_question"] = [uq_start, len(token_ids)]
+                    question_text = (placeholder_values or {}).get("user_question", "")
+                    question_pos = prompt_text.find(question_text) if question_text else -1
+                    if question_pos >= 0:
+                        uq_start = len(self._encode(prompt_text[:question_pos]))
+                    else:
+                        uq_start = len(token_ids) - uq_num_tokens
+                    uq_end = min(len(token_ids), uq_start + uq_num_tokens)
+                    placeholder_info_for_reuse["user_question"] = [uq_start, uq_end]
                     reuse_span_source = "runtime_input_anchor"
             logger.info(
-                "[REUSE_SPAN:paged] node={} role={} request_uid={} source={} has_uq_meta={} prompt_tokens={} uq_span={}",
+                "[REUSE_SPAN:paged] node={} role={} request_uid={} source={} has_uq_meta={} prompt_tokens={} uq_span={} prompt_source={}",
                 getattr(self, "node_id", "?"),
                 getattr(self, "role", "?"),
                 request_uid,
@@ -944,11 +1837,15 @@ class PagedLLMChat(LLM):
                 isinstance(uq_meta, (list, tuple)) and len(uq_meta) >= 2,
                 len(token_ids),
                 placeholder_info_for_reuse.get("user_question"),
+                prompt_source,
             )
             # dense_prefill anchor writes should prefer runtime placeholder spans.
             if dynamic_placeholder_info:
                 placeholder_info_for_anchor = dynamic_placeholder_info
                 placeholder_source = "dynamic_prompt"
+            elif runtime_placeholder_info:
+                placeholder_info_for_anchor = runtime_placeholder_info
+                placeholder_source = "runtime_resolved_values"
             else:
                 # If prompt has no explicit placeholders, only keep template spans
                 # that are valid for the current prompt length.
@@ -979,6 +1876,7 @@ class PagedLLMChat(LLM):
 
             cached_prefix_block_table = None
             cached_prefix_num_tokens = 0
+            offset_stats: Dict[str, Any] = {}
             if mode == "kv_reuse":
                 (
                     cached_prefix_block_table,
@@ -993,6 +1891,7 @@ class PagedLLMChat(LLM):
                 reuse_stats["anchor_candidates"] = offset_stats["anchor_candidates"]
                 reuse_stats["offset_calls"] = offset_stats["offset_calls"]
                 reuse_stats["offset_effective"] = offset_stats["offset_effective"]
+                reuse_stats["offset_applied"] = bool(offset_stats.get("offset_applied"))
                 if not offset_stats["offset_applied"]:
                     reason = offset_stats.get("fallback_reason", "unknown")
                     _record_anchor_skip(f"kv_reuse_fallback:{reason}")
@@ -1000,12 +1899,48 @@ class PagedLLMChat(LLM):
                         "kv_reuse fallback to dense behavior for this request: {}",
                         reason,
                     )
+                self._record_radix_debug(
+                    output_dir=radix_debug_output_dir,
+                    request_uid=request_uid,
+                    stage="kv_reuse_prepare",
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    agent_role=agent_role,
+                    payload={
+                        "request_message": request_message,
+                        "mode": mode,
+                        "prompt_source": prompt_source,
+                        "prompt_tokens": len(token_ids),
+                        "reuse_span_source": reuse_span_source,
+                        "placeholder_source": placeholder_source,
+                        "stored_placeholder_info": stored_placeholder_info,
+                        "runtime_placeholder_info": runtime_placeholder_info,
+                        "placeholder_info_for_reuse": placeholder_info_for_reuse,
+                        "selected_placeholder_id": offset_stats.get("selected_placeholder_id"),
+                        "pre_token_span": offset_stats.get("pre_token_span"),
+                        "placeholder_token_span": offset_stats.get("placeholder_token_span"),
+                        "suffix_token_span": offset_stats.get("suffix_token_span"),
+                        "pre_block_span": offset_stats.get("pre_block_span"),
+                        "placeholder_block_span": offset_stats.get("placeholder_block_span"),
+                        "suffix_block_span": offset_stats.get("suffix_block_span"),
+                        "base_block_table_len": offset_stats.get("base_block_table_len"),
+                        "base_ph_blocks_len": offset_stats.get("base_ph_blocks_len"),
+                        "base_pf_blocks_len": offset_stats.get("base_pf_blocks_len"),
+                        "new_ph_blocks_len": offset_stats.get("new_ph_blocks_len"),
+                        "new_pf_blocks_len": offset_stats.get("new_pf_blocks_len"),
+                        "combined_blocks": offset_stats.get("combined_blocks"),
+                        "expected_blocks": offset_stats.get("expected_blocks"),
+                        "anchor_candidates": offset_stats.get("anchor_candidates"),
+                        "offset_calls": offset_stats.get("offset_calls"),
+                        "offset_effective": offset_stats.get("offset_effective"),
+                        "offset_applied": offset_stats.get("offset_applied"),
+                        "fallback_reason": offset_stats.get("fallback_reason"),
+                    },
+                )
 
             # Generate through nano-vllm engine
-            preprocess_latency = 0.0
-            if preprocess_start is not None:
-                preprocess_latency = max(0.0, perf_counter() - preprocess_start)
-            completion_ids, ttft, prefill_latency, seq = self._generate_tokens(
+            preprocess_latency = perf_counter() - preprocess_start
+            completion_ids, ttft, seq = self._generate_tokens(
                 token_ids,
                 max_tokens,
                 temperature,
@@ -1014,54 +1949,137 @@ class PagedLLMChat(LLM):
             )
             pinned_block_table = list(getattr(seq, "_pinned_block_table", []) or [])
 
-            # Align with HF backend: preprocess_latency includes engine prefill,
-            # generation_ttft is decode-only (ttft minus prefill).
-            preprocess_latency += prefill_latency
-            generation_ttft = max(0.0, ttft - prefill_latency)
-            total_ttft = ttft
-            if preprocess_start is not None:
-                total_ttft = preprocess_latency + generation_ttft
+            total_ttft = ttft + preprocess_latency
 
             # Block table now contains all KV blocks for this generation
             block_table = list(getattr(seq, "_block_table_snapshot", list(seq.block_table)))
+            prompt_block_table = list(
+                getattr(
+                    seq,
+                    "_prompt_block_table_snapshot",
+                    self._prompt_block_table_snapshot(
+                        block_table,
+                        len(token_ids),
+                        self.paged_kv_engine.block_size,
+                    ),
+                )
+            )
             prompt_num_tokens = len(token_ids)
             total_num_tokens = int(getattr(seq, "_num_tokens_snapshot", len(seq)))
-            reuse_stats["num_cached_tokens"] = int(getattr(seq, "num_cached_tokens", 0))
-            reuse_stats["num_blocks"] = len(block_table)
+            prompt_block_count = int(
+                getattr(seq, "_prompt_block_count_snapshot", len(prompt_block_table))
+            )
+            full_block_count = len(block_table)
+            reuse_stats["num_cached_tokens"] = int(
+                getattr(seq, "_num_cached_tokens_snapshot", getattr(seq, "num_cached_tokens", 0))
+            )
+            reuse_stats["num_blocks"] = full_block_count
+            reuse_stats["prompt_block_count"] = prompt_block_count
+            reuse_stats["full_block_count"] = full_block_count
+            reuse_stats["prompt_only_runtime_exceeds_template"] = False
             reuse_stats["placeholder_count"] = len(placeholder_info_for_anchor)
+            reuse_stats["applied_reuse_hit"] = bool(
+                reuse_stats["offset_applied"] or reuse_stats["num_cached_tokens"] > 0
+            )
+            reuse_stats["effective_reuse_hit"] = bool(
+                reuse_stats["num_cached_tokens"] > 0 or reuse_stats["offset_effective"] > 0
+            )
 
             # ── Anchor operations ──
             if mode == "dense_prefill" and placeholder_info_for_anchor:
                 # After full prefill, store anchor deltas
                 for ph_id, (ph_start, ph_end) in placeholder_info_for_anchor.items():
+                    if self.paged_backend != "radix":
+                        anchor_messages = list(self.paged_kv_engine.anchors.get(ph_id, {}).keys())
+                        reuse_stats["anchor_candidates"] += len(anchor_messages)
+
+                        bs = self.paged_kv_engine.block_size
+                        ph_start_block = ph_start // bs
+                        ph_end_block = (ph_end - 1) // bs + 1
+                        ph_blocks = prompt_block_table[ph_start_block:ph_end_block]
+                        ph_num = ph_end - ph_start
+
+                        pf_start = ph_end
+                        pf_end = prompt_num_tokens
+                        pf_start_block = pf_start // bs
+                        pf_end_block = (pf_end - 1) // bs + 1 if pf_end > pf_start else pf_start_block
+                        pf_blocks = prompt_block_table[pf_start_block:pf_end_block]
+                        pf_num = pf_end - pf_start
+
+                        if ph_num <= 0 or not ph_blocks or ph_start_block >= len(prompt_block_table):
+                            _record_anchor_skip("placeholder_blocks_out_of_range")
+                            continue
+                        if ph_end > prompt_num_tokens:
+                            _record_anchor_skip("placeholder_end_exceeds_prompt")
+                            continue
+                        if pf_num <= 0 or not pf_blocks:
+                            _record_anchor_skip("prefix_blocks_out_of_range")
+                            continue
+
+                        base_block_table = prefix_store.get("prefix_block_table", [])
+                        if not base_block_table:
+                            _record_anchor_skip("missing_prefix_block_table")
+                            continue
+
+                        base_ph_blocks = base_block_table[ph_start_block:ph_end_block]
+                        base_pf_blocks = base_block_table[pf_start_block:pf_end_block]
+                        if not base_ph_blocks:
+                            _record_anchor_skip("base_blocks_out_of_range")
+                            continue
+                        if not base_pf_blocks:
+                            _record_anchor_skip("base_prefix_blocks_out_of_range")
+                            continue
+
+                        self.paged_kv_engine.set_anchor(
+                            agent_id=self.node_id,
+                            ph_id=ph_id,
+                            message=message_key,
+                            real_block_table=ph_blocks,
+                            real_num_tokens=ph_num,
+                            base_block_table=base_ph_blocks,
+                            base_num_tokens=ph_num,
+                            real_prefix_block_table=pf_blocks,
+                            real_prefix_num_tokens=pf_num,
+                            base_prefix_block_table=base_pf_blocks,
+                            base_prefix_num_tokens=pf_num,
+                        )
+                        reuse_stats["anchor_set_count"] += 1
+                        continue
+
+                    if ph_id != "user_question":
+                        _record_anchor_skip("non_user_question_reuse_disabled")
+                        continue
+
                     anchor_messages = list(self.paged_kv_engine.anchors.get(ph_id, {}).keys())
                     reuse_stats["anchor_candidates"] += len(anchor_messages)
 
                     # Block range for placeholder portion
                     bs = self.paged_kv_engine.block_size
-                    ph_start_block = ph_start // bs
-                    ph_end_block = (ph_end - 1) // bs + 1
-                    ph_blocks = block_table[ph_start_block:ph_end_block]
                     ph_num = ph_end - ph_start
+                    runtime_ph = self._block_slice_layout(ph_start, ph_num, bs)
+                    ph_start_block = runtime_ph["start_block"]
+                    ph_end_block = runtime_ph["end_block"]
+                    ph_blocks = prompt_block_table[ph_start_block:ph_end_block]
 
                     # Block range for prefix after placeholder
                     pf_start = ph_end
                     pf_end = prompt_num_tokens
-                    pf_start_block = pf_start // bs
-                    pf_end_block = (pf_end - 1) // bs + 1
-                    pf_blocks = block_table[pf_start_block:pf_end_block]
                     pf_num = pf_end - pf_start
+                    runtime_pf = self._block_slice_layout(pf_start, pf_num, bs)
+                    pf_start_block = runtime_pf["start_block"]
+                    pf_end_block = runtime_pf["end_block"]
+                    pf_blocks = prompt_block_table[pf_start_block:pf_end_block]
 
                     # Validate that block ranges are within the actual block table.
                     # placeholder_info positions are from the template prompt; if the
                     # generation prompt is shorter (e.g. just the task string), the
                     # block indices can fall out of range.
-                    if ph_num <= 0 or not ph_blocks or ph_start_block >= len(block_table):
+                    if ph_num <= 0 or not ph_blocks or ph_start_block >= len(prompt_block_table):
                         _record_anchor_skip("placeholder_blocks_out_of_range")
                         logger.info(
                             "dense_prefill: skipping set_anchor for {} — placeholder blocks "
                             "out of range (ph_start_block={}, block_table_len={})",
-                            ph_id, ph_start_block, len(block_table),
+                            ph_id, ph_start_block, len(prompt_block_table),
                         )
                         continue
 
@@ -1083,53 +2101,106 @@ class PagedLLMChat(LLM):
                             ph_id,
                             pf_start_block,
                             pf_end_block,
-                            len(block_table),
+                            len(prompt_block_table),
                             pf_num,
                         )
                         continue
 
                     # We need base blocks - stored in prefix_block_info
                     base_block_table = prefix_store.get("prefix_block_table", [])
-                    if base_block_table:
-                        base_ph_blocks = base_block_table[ph_start_block:ph_end_block]
-                        base_pf_blocks = base_block_table[pf_start_block:pf_end_block]
-
-                        if not base_ph_blocks:
-                            _record_anchor_skip("base_blocks_out_of_range")
-                            logger.info(
-                                "dense_prefill: skipping set_anchor for {} — base blocks out of range",
-                                ph_id,
-                            )
-                            continue
-
-                        if not base_pf_blocks:
-                            _record_anchor_skip("base_prefix_blocks_out_of_range")
-                            logger.info(
-                                "dense_prefill: skipping set_anchor for {} — base prefix blocks out of range",
-                                ph_id,
-                            )
-                            continue
-
-                        self.paged_kv_engine.set_anchor(
-                            agent_id=self.node_id,
-                            ph_id=ph_id,
-                            message=message_key,
-                            real_block_table=ph_blocks,
-                            real_num_tokens=ph_num,
-                            base_block_table=base_ph_blocks,
-                            base_num_tokens=ph_num,
-                            real_prefix_block_table=pf_blocks,
-                            real_prefix_num_tokens=pf_num,
-                            base_prefix_block_table=base_pf_blocks,
-                            base_prefix_num_tokens=pf_num,
-                        )
-                        reuse_stats["anchor_set_count"] += 1
-                    else:
+                    template_span = stored_placeholder_info.get(ph_id)
+                    if not base_block_table:
                         _record_anchor_skip("missing_prefix_block_table")
                         logger.info(
                             "dense_prefill: skipping set_anchor for {} — missing prefix_block_table",
                             ph_id,
                         )
+                        continue
+                    if not template_span:
+                        _record_anchor_skip("missing_template_placeholder_span")
+                        continue
+                    if len(prompt_block_table) > len(base_block_table):
+                        reuse_stats["prompt_only_runtime_exceeds_template"] = True
+                        _record_anchor_skip("runtime_span_exceeds_template_blocks")
+                        logger.info(
+                            "dense_prefill: skipping set_anchor for {} — runtime prompt blocks {} exceed template blocks {}",
+                            ph_id,
+                            len(prompt_block_table),
+                            len(base_block_table),
+                        )
+                        continue
+
+                    base_ph_start, base_ph_end = template_span
+                    base_pf_start = base_ph_end
+                    base_ph = self._block_slice_layout(base_ph_start, ph_num, bs)
+                    base_pf = self._block_slice_layout(base_pf_start, pf_num, bs)
+                    base_ph_blocks = base_block_table[base_ph["start_block"]:base_ph["end_block"]]
+                    base_pf_blocks = base_block_table[base_pf["start_block"]:base_pf["end_block"]]
+
+                    if not base_ph_blocks:
+                        reuse_stats["prompt_only_runtime_exceeds_template"] = True
+                        _record_anchor_skip("base_blocks_out_of_range")
+                        logger.info(
+                            "dense_prefill: skipping set_anchor for {} — base blocks out of range",
+                            ph_id,
+                        )
+                        continue
+
+                    if pf_num > 0 and not base_pf_blocks:
+                        reuse_stats["prompt_only_runtime_exceeds_template"] = True
+                        _record_anchor_skip("base_prefix_blocks_out_of_range")
+                        logger.info(
+                            "dense_prefill: skipping set_anchor for {} — base prefix blocks out of range",
+                            ph_id,
+                        )
+                        continue
+
+                    if not self._slice_fits_block_capacity(
+                        base_ph_blocks,
+                        base_ph["block_offset"],
+                        ph_num,
+                        bs,
+                    ):
+                        reuse_stats["prompt_only_runtime_exceeds_template"] = True
+                        _record_anchor_skip("runtime_span_exceeds_template_blocks")
+                        logger.info(
+                            "dense_prefill: skipping set_anchor for {} — runtime placeholder span exceeds template block capacity",
+                            ph_id,
+                        )
+                        continue
+
+                    if pf_num > 0 and not self._slice_fits_block_capacity(
+                        base_pf_blocks,
+                        base_pf["block_offset"],
+                        pf_num,
+                        bs,
+                    ):
+                        reuse_stats["prompt_only_runtime_exceeds_template"] = True
+                        _record_anchor_skip("runtime_prompt_exceeds_template_blocks")
+                        logger.info(
+                            "dense_prefill: skipping set_anchor for {} — runtime suffix span exceeds template block capacity",
+                            ph_id,
+                        )
+                        continue
+
+                    self.paged_kv_engine.set_anchor(
+                        agent_id=self.node_id,
+                        ph_id=ph_id,
+                        message=message_key,
+                        real_block_table=ph_blocks,
+                        real_num_tokens=ph_num,
+                        base_block_table=base_ph_blocks,
+                        base_num_tokens=ph_num,
+                        real_prefix_block_table=pf_blocks,
+                        real_prefix_num_tokens=pf_num,
+                        base_prefix_block_table=base_pf_blocks,
+                        base_prefix_num_tokens=pf_num,
+                        real_block_offset=runtime_ph["block_offset"],
+                        base_block_offset=base_ph["block_offset"],
+                        real_prefix_block_offset=runtime_pf["block_offset"],
+                        base_prefix_block_offset=base_pf["block_offset"],
+                    )
+                    reuse_stats["anchor_set_count"] += 1
 
             elif mode == "kv_reuse" and cached_prefix_block_table:
                 logger.debug(
@@ -1141,57 +2212,10 @@ class PagedLLMChat(LLM):
             # Store response block info for future reuse
             mem = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
             resp_blocks = mem.setdefault("response_blocks", {})
-            resp_start_block = prompt_num_tokens // self.paged_kv_engine.block_size
-            response_block_table = block_table[resp_start_block:]
-            response_num_tokens = total_num_tokens - prompt_num_tokens
             resp_blocks.setdefault(message_key, []).append({
-                "block_table": response_block_table,
-                "num_tokens": response_num_tokens,
+                "block_table": block_table[prompt_num_tokens // self.paged_kv_engine.block_size:],
+                "num_tokens": total_num_tokens - prompt_num_tokens,
             })
-
-            # ── Response anchor prediction (mirrors HF gpt_chat.py logic) ──
-            response_anchor_key = f"agent_{self.node_id}_current"
-            resp_anchor_messages = list(
-                self.paged_kv_engine.anchors.get(response_anchor_key, {}).keys()
-            )
-            resp_info_bucket = PagedLLMChat._anchor_info_dict.setdefault(response_anchor_key, {})
-            resp_global_bucket = PagedLLMChat._global_anchor_info_dict.setdefault(response_anchor_key, {})
-
-            if response_block_table and response_num_tokens > 0:
-                resp_prob, resp_activated = self.paged_kv_engine.predict_as_anchor(
-                    ph_id=response_anchor_key,
-                    candidate_block_table=response_block_table,
-                    candidate_num_tokens=response_num_tokens,
-                    anchor_messages=resp_anchor_messages,
-                    top_p=0.9,
-                    entropy_threshold=self.config.threshold,
-                    max_compare_anchors=self.config.max_anchor_num,
-                )
-            else:
-                resp_prob, resp_activated = True, []
-
-            safe_msg = _escape_loguru_markup(message)
-            reuse_label = "REUSABLE" if not resp_prob else "NEW_ANCHOR"
-            logger.opt(colors=True).info(
-                f"<magenta>[RESPONSE_ANCHOR:paged] Agent {self.node_id} Role {self.role} | {reuse_label} | anchors={len(resp_anchor_messages)} | Message {safe_msg}</magenta>",
-            )
-
-            if not resp_prob:
-                # Reusable — update activation counts
-                for idx, anchor_msg_key in enumerate(resp_anchor_messages):
-                    if idx >= len(resp_activated):
-                        break
-                    resp_info_bucket[anchor_msg_key] = resp_activated[idx]
-                    bucket_entry = resp_global_bucket.setdefault(anchor_msg_key, [0, 0])
-                    bucket_entry[0] = resp_activated[idx]
-            else:
-                # New anchor — only record the flag; do NOT register_base_anchor here.
-                # Registering without agent deltas causes has_active_anchor to force
-                # dense prefill for all agents that haven't stored a delta yet.
-                # The actual anchor (with deltas) will be created by set_anchor
-                # during the next dense_prefill pass, matching HF gpt_chat.py behavior.
-                resp_info_bucket[message_key] = 0
-                resp_global_bucket[message_key] = [0, response_num_tokens]
 
             # Decode response
             response_text = self.tokenizer.decode(completion_ids, skip_special_tokens=True)
@@ -1204,10 +2228,36 @@ class PagedLLMChat(LLM):
             metadata: Dict[str, Any] = {
                 "placeholder_ids": list(placeholder_info_for_anchor.keys()),
                 "reuse_stats": reuse_stats,
+                "prompt_source": prompt_source,
+                "prompt_tokens": reuse_stats["prompt_tokens"],
+                "prompt_block_count": reuse_stats["prompt_block_count"],
+                "full_block_count": reuse_stats["full_block_count"],
+                "input_messages": resolved_messages,
+                "prompt_text": prompt_text,
+                "radix_debug": {
+                    "reuse_span_source": reuse_span_source,
+                    "placeholder_source": placeholder_source,
+                    "stored_placeholder_info": stored_placeholder_info,
+                    "runtime_placeholder_info": runtime_placeholder_info,
+                    "placeholder_info_for_reuse": placeholder_info_for_reuse,
+                    "selected_placeholder_id": offset_stats.get("selected_placeholder_id"),
+                    "pre_token_span": offset_stats.get("pre_token_span"),
+                    "placeholder_token_span": offset_stats.get("placeholder_token_span"),
+                    "suffix_token_span": offset_stats.get("suffix_token_span"),
+                    "pre_block_span": offset_stats.get("pre_block_span"),
+                    "placeholder_block_span": offset_stats.get("placeholder_block_span"),
+                    "suffix_block_span": offset_stats.get("suffix_block_span"),
+                    "base_block_table_len": offset_stats.get("base_block_table_len"),
+                    "base_ph_blocks_len": offset_stats.get("base_ph_blocks_len"),
+                    "base_pf_blocks_len": offset_stats.get("base_pf_blocks_len"),
+                    "new_ph_blocks_len": offset_stats.get("new_ph_blocks_len"),
+                    "new_pf_blocks_len": offset_stats.get("new_pf_blocks_len"),
+                    "combined_blocks": offset_stats.get("combined_blocks"),
+                    "expected_blocks": offset_stats.get("expected_blocks"),
+                    "fallback_reason": offset_stats.get("fallback_reason"),
+                    "prompt_only_runtime_exceeds_template": reuse_stats["prompt_only_runtime_exceeds_template"],
+                },
             }
-            if preprocess_start is not None:
-                metadata["preprocess_latency"] = preprocess_latency
-                metadata["generation_ttft"] = generation_ttft
             if request_uid:
                 metadata["request_uid"] = request_uid
             if agent_id:
@@ -1221,19 +2271,69 @@ class PagedLLMChat(LLM):
                 "timestamp": time.time(),
                 "mode": mode,
                 "ttft": float(total_ttft),
-                "generation_ttft": float(generation_ttft),
-                "preprocess_latency": float(preprocess_latency) if preprocess_start is not None else None,
                 "request_uid": request_uid,
                 "agent_id": agent_id,
-                "message": message_key if message else None,
+                "message": message_key if message_key_source is not None else None,
+                "request_message": request_message,
+                "prompt_source": prompt_source,
+                "prompt_tokens": reuse_stats["prompt_tokens"],
+                "prompt_block_count": reuse_stats["prompt_block_count"],
+                "full_block_count": reuse_stats["full_block_count"],
                 "num_cached_tokens": reuse_stats["num_cached_tokens"],
                 "num_blocks": reuse_stats["num_blocks"],
                 "anchor_candidates": reuse_stats["anchor_candidates"],
                 "offset_calls": reuse_stats["offset_calls"],
                 "offset_effective": reuse_stats["offset_effective"],
+                "offset_applied": reuse_stats["offset_applied"],
+                "applied_reuse_hit": reuse_stats["applied_reuse_hit"],
+                "effective_reuse_hit": reuse_stats["effective_reuse_hit"],
+                "prompt_only_runtime_exceeds_template": reuse_stats["prompt_only_runtime_exceeds_template"],
                 "anchor_set_count": reuse_stats["anchor_set_count"],
                 "anchor_skip_reasons": reuse_stats["anchor_skip_reasons"],
             })
+
+            self._record_radix_debug(
+                output_dir=radix_debug_output_dir,
+                request_uid=request_uid,
+                stage="generation_result",
+                agent_id=agent_id,
+                agent_name=agent_name,
+                agent_role=agent_role,
+                payload={
+                    "request_message": request_message,
+                    "mode": mode,
+                    "prompt_source": prompt_source,
+                    "prompt_tokens": reuse_stats["prompt_tokens"],
+                    "prompt_block_count": reuse_stats["prompt_block_count"],
+                    "full_block_count": reuse_stats["full_block_count"],
+                    "reuse_span_source": reuse_span_source,
+                    "placeholder_source": placeholder_source,
+                    "selected_placeholder_id": offset_stats.get("selected_placeholder_id"),
+                    "pre_token_span": offset_stats.get("pre_token_span"),
+                    "placeholder_token_span": offset_stats.get("placeholder_token_span"),
+                    "suffix_token_span": offset_stats.get("suffix_token_span"),
+                    "pre_block_span": offset_stats.get("pre_block_span"),
+                    "placeholder_block_span": offset_stats.get("placeholder_block_span"),
+                    "suffix_block_span": offset_stats.get("suffix_block_span"),
+                    "base_block_table_len": offset_stats.get("base_block_table_len"),
+                    "base_ph_blocks_len": offset_stats.get("base_ph_blocks_len"),
+                    "base_pf_blocks_len": offset_stats.get("base_pf_blocks_len"),
+                    "new_ph_blocks_len": offset_stats.get("new_ph_blocks_len"),
+                    "new_pf_blocks_len": offset_stats.get("new_pf_blocks_len"),
+                    "combined_blocks": offset_stats.get("combined_blocks"),
+                    "expected_blocks": offset_stats.get("expected_blocks"),
+                    "fallback_reason": offset_stats.get("fallback_reason"),
+                    "anchor_candidates": reuse_stats["anchor_candidates"],
+                    "offset_calls": reuse_stats["offset_calls"],
+                    "offset_effective": reuse_stats["offset_effective"],
+                    "offset_applied": reuse_stats["offset_applied"],
+                    "num_cached_tokens": reuse_stats["num_cached_tokens"],
+                    "applied_reuse_hit": reuse_stats["applied_reuse_hit"],
+                    "effective_reuse_hit": reuse_stats["effective_reuse_hit"],
+                    "prompt_only_runtime_exceeds_template": reuse_stats["prompt_only_runtime_exceeds_template"],
+                    "anchor_skip_reasons": reuse_stats["anchor_skip_reasons"],
+                },
+            )
 
             if pinned_block_table:
                 self.paged_kv_engine.free_blocks(pinned_block_table)
@@ -1260,6 +2360,7 @@ class PagedLLMChat(LLM):
         include_eot: bool = False,
         anchor_namespace: str = "user_question",
         test_time: bool = False,
+        radix_debug_output_dir: Optional[Union[str, Path]] = None,
     ) -> str:
         """Compute input KV via engine and decide kv_reuse vs dense_prefill.
 
@@ -1325,6 +2426,7 @@ class PagedLLMChat(LLM):
         candidate_num = num_tokens - drop_num
         bs = self.paged_kv_engine.block_size
         candidate_start_block = drop_num // bs
+        candidate_start_offset = drop_num - candidate_start_block * bs
         candidate_blocks = block_table[candidate_start_block:]
 
         anchor_messages = list(self.paged_kv_engine.anchors.get(anchor_namespace, {}).keys())
@@ -1334,6 +2436,7 @@ class PagedLLMChat(LLM):
             candidate_block_table=candidate_blocks,
             candidate_num_tokens=candidate_num,
             anchor_messages=anchor_messages,
+            candidate_start_offset=candidate_start_offset,
             top_p=0.9,
             entropy_threshold=self.config.threshold,
             max_compare_anchors=self.config.max_anchor_num,
@@ -1358,6 +2461,7 @@ class PagedLLMChat(LLM):
         )
 
         message_key = self._message_cache_key(message)
+        created_anchor = False
 
         if not prob:
             for idx, anchor_msg_key in enumerate(anchor_messages):
@@ -1371,6 +2475,26 @@ class PagedLLMChat(LLM):
             # kv_reuse span reconstruction can align to current prompt.
             global_bucket[message] = [0, candidate_num]
             global_bucket[message_key] = [0, candidate_num]
+            self._record_radix_debug(
+                output_dir=radix_debug_output_dir,
+                request_uid=request_uid,
+                stage="update_input_anchor",
+                agent_id=agent_id,
+                agent_role=getattr(self, "role", None),
+                payload={
+                    "request_message": message,
+                    "anchor_namespace": anchor_namespace,
+                    "message_key": message_key,
+                    "candidate_num_tokens": candidate_num,
+                    "drop_num": drop_num,
+                    "candidate_block_count": len(candidate_blocks),
+                    "block_table_len": len(block_table),
+                    "anchor_candidates": len(anchor_messages),
+                    "anchor_activated_list": anchor_activated_list,
+                    "decision": "kv_reuse",
+                    "created_base_anchor": False,
+                },
+            )
             return "kv_reuse"
 
         # Bootstrap anchor history directly from candidate blocks when no
@@ -1381,8 +2505,10 @@ class PagedLLMChat(LLM):
                 message=message,
                 block_table=candidate_blocks,
                 num_tokens=candidate_num,
+                start_offset=candidate_start_offset,
             )
             if created:
+                created_anchor = True
                 logger.info(
                     "[ANCHOR_CREATE:paged] node={} role={} request_uid={} ph_id={} message={} num_tokens={} num_blocks={} source=update_input_anchor",
                     getattr(self, "node_id", "?"),
@@ -1398,6 +2524,27 @@ class PagedLLMChat(LLM):
         uq_info_bucket[message_key] = 0
         global_bucket[message] = [0, candidate_num]
         global_bucket[message_key] = [0, candidate_num]
+        self._record_radix_debug(
+            output_dir=radix_debug_output_dir,
+            request_uid=request_uid,
+            stage="update_input_anchor",
+            agent_id=agent_id,
+            agent_role=getattr(self, "role", None),
+            payload={
+                "request_message": message,
+                "anchor_namespace": anchor_namespace,
+                "message_key": message_key,
+                "candidate_num_tokens": candidate_num,
+                "drop_num": drop_num,
+                    "candidate_block_count": len(candidate_blocks),
+                    "candidate_block_offset": candidate_start_offset,
+                    "block_table_len": len(block_table),
+                "anchor_candidates": len(anchor_messages),
+                "anchor_activated_list": anchor_activated_list,
+                "decision": "dense_prefill" if prob else "kv_reuse",
+                "created_base_anchor": created_anchor,
+            },
+        )
         if prob:
             return "dense_prefill"
         return "kv_reuse"
@@ -1410,11 +2557,13 @@ class PagedLLMChat(LLM):
         message: str,
         content: str,
         prefix_text: str,
+        owner_agent_role: Optional[str] = None,
         role: str = "user",
         include_begin: bool = True,
         include_eot: bool = False,
         anchor_namespace: Optional[str] = None,
         max_length: int = None,
+        radix_debug_output_dir: Optional[Union[str, Path]] = None,
     ) -> bool:
         """Materialise condition KV cache for another agent and update anchors.
 
@@ -1427,9 +2576,24 @@ class PagedLLMChat(LLM):
         anchor_key = anchor_namespace or f"condition_{owner_agent_id}_current"
         owner_memory = PagedLLMChat._shared_kv_cache_memory.setdefault(owner_agent_id, {})
         condition_bucket = owner_memory.setdefault("condition_blocks", {})
+        message_key = self._message_cache_key(message)
 
         if message in condition_bucket:
             # Already materialised
+            self._record_radix_debug(
+                output_dir=radix_debug_output_dir,
+                request_uid=request_uid,
+                stage="update_condition_anchor",
+                agent_id=owner_agent_id,
+                agent_role=owner_agent_role or getattr(self, "role", None),
+                payload={
+                    "request_message": message,
+                    "anchor_namespace": anchor_key,
+                    "message_key": message_key,
+                    "decision": "reuse_existing_condition",
+                    "created_base_anchor": False,
+                },
+            )
             return False
 
         text = self.format_chat_segment(role, content, include_begin=include_begin, include_eot=include_eot)
@@ -1466,6 +2630,7 @@ class PagedLLMChat(LLM):
         candidate_num = num_tokens - drop_num
         bs = self.paged_kv_engine.block_size
         candidate_start_block = drop_num // bs
+        candidate_start_offset = drop_num - candidate_start_block * bs
         candidate_blocks = block_table[candidate_start_block:]
 
         anchor_messages = list(self.paged_kv_engine.anchors.get(anchor_key, {}).keys())
@@ -1475,6 +2640,7 @@ class PagedLLMChat(LLM):
             candidate_block_table=candidate_blocks,
             candidate_num_tokens=candidate_num,
             anchor_messages=anchor_messages,
+            candidate_start_offset=candidate_start_offset,
             top_p=0.9,
             entropy_threshold=self.config.threshold,
             max_compare_anchors=self.config.max_anchor_num,
@@ -1482,7 +2648,7 @@ class PagedLLMChat(LLM):
 
         cond_info_bucket = PagedLLMChat._anchor_info_dict.setdefault(anchor_key, {})
         global_bucket = PagedLLMChat._global_anchor_info_dict.setdefault(anchor_key, {})
-        message_key = self._message_cache_key(message)
+        created_anchor = False
 
         if not prob:
             for idx, anchor_msg_key in enumerate(anchor_messages):
@@ -1500,8 +2666,10 @@ class PagedLLMChat(LLM):
                     message=message,
                     block_table=candidate_blocks,
                     num_tokens=candidate_num,
+                    start_offset=candidate_start_offset,
                 )
                 if created:
+                    created_anchor = True
                     safe_msg = _escape_loguru_markup(message)
                     logger.info(
                         "[ANCHOR_CREATE:paged] node={} role={} request_uid={} ph_id={} message={} num_tokens={} num_blocks={} source=update_condition_anchor",
@@ -1517,6 +2685,28 @@ class PagedLLMChat(LLM):
             cond_info_bucket[message_key] = 0
             global_bucket[message] = [0, candidate_num]
             global_bucket[message_key] = [0, candidate_num]
+
+        self._record_radix_debug(
+            output_dir=radix_debug_output_dir,
+            request_uid=request_uid,
+            stage="update_condition_anchor",
+            agent_id=owner_agent_id,
+            agent_role=owner_agent_role or getattr(self, "role", None),
+            payload={
+                "request_message": message,
+                "anchor_namespace": anchor_key,
+                "message_key": message_key,
+                "candidate_num_tokens": candidate_num,
+                "drop_num": drop_num,
+                "candidate_block_count": len(candidate_blocks),
+                "candidate_block_offset": candidate_start_offset,
+                "block_table_len": len(block_table),
+                "anchor_candidates": len(anchor_messages),
+                "anchor_activated_list": anchor_activated_list,
+                "decision": "dense_prefill" if prob else "kv_reuse",
+                "created_base_anchor": created_anchor,
+            },
+        )
 
         return prob  # True = new anchor needed (dense_prefill)
 
@@ -1602,11 +2792,15 @@ class PagedLLMChat(LLM):
         min_tokens: Optional[int] = None,
         temperature: Optional[float] = None,
         request_uid: Optional[str] = None,
-        mode: str = "dense_prefill",
+        mode: str = "kv_reuse",
         agent_id: Optional[str] = None,
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
         output_dir: Optional[Union[str, Path]] = None,
+        radix_debug_output_dir: Optional[Union[str, Path]] = None,
+        request_message: Optional[str] = None,
+        prompt_source: str = "call_input",
+        placeholder_values: Optional[Dict[str, str]] = None,
     ) -> GenerationResult:
         """Benchmark: run BOTH kv_reuse and dense_prefill, compare TTFT.
 
@@ -1622,16 +2816,27 @@ class PagedLLMChat(LLM):
         if request_uid is None:
             raise ValueError("request_uid must be provided for agen_kvcomm_time_test.")
 
-        message = messages[0] if isinstance(messages, list) else messages
-        message_key = self._message_cache_key(message)
+        resolved_messages = self._normalise_messages(messages)
+        message_key_source = request_message if request_message is not None else messages
+        message_key = self._message_cache_key(message_key_source)
 
         # Build prompt
         prefix_store = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
-        placeholder_info = prefix_store.get("placeholder_info", {})
+        stored_placeholder_info = prefix_store.get("placeholder_info", {})
 
-        prompt_text = self._build_prompt_text(message)
+        prompt_text = self._build_prompt_text(resolved_messages)
         token_ids = self._encode(prompt_text)
         prompt_num_tokens = len(token_ids)
+        runtime_placeholder_info = self._locate_runtime_placeholders(
+            prompt_text,
+            placeholder_values or {},
+            stored_placeholder_info,
+        )
+        placeholder_info = runtime_placeholder_info or {
+            ph_id: span
+            for ph_id, span in stored_placeholder_info.items()
+            if span[0] >= 0 and span[1] > span[0] and span[1] <= prompt_num_tokens
+        }
 
         safe_prompt = _escape_loguru_markup(prompt_text)
         logger.opt(colors=True).debug(
@@ -1640,7 +2845,7 @@ class PagedLLMChat(LLM):
         )
 
         # ── Run 1: kv_reuse (prefix blocks may be cached by BlockManager hash) ──
-        preprocess_start = perf_counter() if mode == "kv_reuse" else None
+        preprocess_start = perf_counter()
 
         # Apply anchor deltas for kv_reuse if applicable
         if placeholder_info:
@@ -1676,33 +2881,25 @@ class PagedLLMChat(LLM):
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        preprocess_latency = 0.0
-        if preprocess_start is not None:
-            preprocess_latency = max(0.0, perf_counter() - preprocess_start)
+        preprocess_latency = perf_counter() - preprocess_start
 
         # KV-reuse generation (prefix cached → fast)
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        kvcomm_completion_ids, kvcomm_raw_ttft, kvcomm_prefill_lat, kvcomm_seq = self._generate_tokens(
+        kvcomm_completion_ids, kvcomm_gen_ttft, kvcomm_seq = self._generate_tokens(
             token_ids, max_tokens, temperature,
         )
         if torch.cuda.is_available():
             torch.cuda.synchronize()
-        # Align with HF backend: fold engine prefill into preprocess_latency
-        preprocess_latency += kvcomm_prefill_lat
-        kvcomm_gen_ttft = max(0.0, kvcomm_raw_ttft - kvcomm_prefill_lat)
-        kvcomm_ttft_value = preprocess_latency + kvcomm_gen_ttft
-        kvcomm_e2e_latency = 0.0
-        if preprocess_start is not None:
-            kvcomm_e2e_latency = perf_counter() - preprocess_start
+        kvcomm_ttft_value = kvcomm_gen_ttft + preprocess_latency
+        kvcomm_e2e_latency = perf_counter() - preprocess_start
 
-        safe_msg = _escape_loguru_markup(str(message))
-        if mode == "kv_reuse" and preprocess_start is not None:
-            logger.opt(colors=True).info(
-                f"<green>Agent {self.node_id} Role {self.role} Message {safe_msg} "
-                f"KVCOMM(Paged) E2E Latency: {kvcomm_e2e_latency:.4f}s "
-                f"TTFT: {kvcomm_ttft_value:.4f}s (Preprocess: {preprocess_latency:.4f}s)</green>",
-            )
+        safe_msg = _escape_loguru_markup(str(message_key_source))
+        logger.opt(colors=True).info(
+            f"<green>Agent {self.node_id} Role {self.role} Message {safe_msg} "
+            f"KVCOMM(Paged) E2E Latency: {kvcomm_e2e_latency:.4f}s "
+            f"TTFT: {kvcomm_ttft_value:.4f}s (Preprocess: {preprocess_latency:.4f}s)</green>",
+        )
 
         # ── Run 2: dense_prefill (full prefill, no block reuse) ──
         # Clear the block manager's cached hash table to force full recompute
@@ -1710,7 +2907,7 @@ class PagedLLMChat(LLM):
             torch.cuda.synchronize()
 
         dense_start = perf_counter()
-        dense_completion_ids, dense_gen_ttft, _dense_prefill_lat, dense_seq = self._generate_tokens(
+        dense_completion_ids, dense_gen_ttft, dense_seq = self._generate_tokens(
             token_ids, max_tokens, temperature,
         )
         if torch.cuda.is_available():
@@ -1725,18 +2922,29 @@ class PagedLLMChat(LLM):
         )
 
         # ── Comparison ──
-        ttft_value = dense_prefill_ttft
-        if mode == "kv_reuse" and preprocess_start is not None and kvcomm_ttft_value > 0:
+        if kvcomm_ttft_value > 0:
             ratio = dense_prefill_ttft / kvcomm_ttft_value
             logger.opt(colors=True).info(
                 f"<green>Agent {self.node_id} Role {self.role} Message {safe_msg} "
                 f"KVCOMM(Paged) is {ratio:.2f}x faster than Dense Prefill in TTFT</green>",
             )
             ttft_value = kvcomm_ttft_value
+        else:
+            ttft_value = dense_prefill_ttft
 
         # ── Post-generation: anchor bookkeeping on the kv_reuse result ──
-        block_table = list(kvcomm_seq.block_table)
+        block_table = list(
+            getattr(kvcomm_seq, "_block_table_snapshot", list(kvcomm_seq.block_table))
+        )
         total_num_tokens = len(kvcomm_seq)
+        prompt_block_count = int(
+            getattr(
+                kvcomm_seq,
+                "_prompt_block_count_snapshot",
+                self._prompt_block_count(prompt_num_tokens, self.paged_kv_engine.block_size),
+            )
+        )
+        full_block_count = len(block_table)
 
         # Store response block info
         mem = PagedLLMChat._shared_kv_cache_memory.get(self.node_id, {})
@@ -1757,10 +2965,15 @@ class PagedLLMChat(LLM):
         # ── Build metadata and latency record ──
         metadata: Dict[str, Any] = {
             "placeholder_ids": list(placeholder_info.keys()),
+            "preprocess_latency": preprocess_latency,
+            "generation_ttft": ttft_value - preprocess_latency,
+            "prompt_source": prompt_source,
+            "prompt_tokens": prompt_num_tokens,
+            "prompt_block_count": prompt_block_count,
+            "full_block_count": full_block_count,
+            "input_messages": resolved_messages,
+            "prompt_text": prompt_text,
         }
-        if preprocess_start is not None:
-            metadata["preprocess_latency"] = preprocess_latency
-            metadata["generation_ttft"] = ttft_value - preprocess_latency
         if request_uid:
             metadata["request_uid"] = request_uid
         if agent_id:
@@ -1775,8 +2988,8 @@ class PagedLLMChat(LLM):
             "mode": mode,
             "backend": "paged",
             "ttft": float(ttft_value),
-            "generation_ttft": float(metadata["generation_ttft"]) if "generation_ttft" in metadata else None,
-            "preprocess_latency": float(preprocess_latency) if preprocess_start is not None else None,
+            "generation_ttft": float(metadata["generation_ttft"]),
+            "preprocess_latency": float(preprocess_latency),
             "dense_prefill_ttft": float(dense_prefill_ttft),
             "kvcomm_end_to_end_latency": float(kvcomm_e2e_latency),
             "dense_end_to_end_latency": float(dense_e2e_latency),
@@ -1785,7 +2998,12 @@ class PagedLLMChat(LLM):
             "agent_id": agent_id,
             "agent_name": agent_name,
             "agent_role": agent_role,
-            "message": str(message) if message is not None else None,
+            "message": str(message_key_source) if message_key_source is not None else None,
+            "request_message": request_message,
+            "prompt_source": prompt_source,
+            "prompt_tokens": prompt_num_tokens,
+            "prompt_block_count": prompt_block_count,
+            "full_block_count": full_block_count,
             "placeholder_ids": list(placeholder_info.keys()),
         }
         _append_latency_record(output_dir, latency_record)

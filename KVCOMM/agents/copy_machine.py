@@ -26,11 +26,12 @@ class CopyMachine(Node):
         domain: str = "",
         llm_name: str = "",
         llm_config: KVCommConfig | None = None,
+        use_flash_attention: bool = False,
     ):
         super().__init__(id, "CopyMachine" ,domain, llm_name)
         prefix = ""
 
-        self.llm = LLMRegistry.get(llm_name, prefix=prefix, llm_config=llm_config)
+        self.llm = LLMRegistry.get(llm_name, prefix=prefix, llm_config=llm_config, use_flash_attention=use_flash_attention)
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role = self.prompt_set.get_role() if role is None else role
         self.llm.set_id(self.id, self.role)
@@ -171,6 +172,7 @@ class CopyMachine(Node):
             **kwargs,
         )
         preferred_mode = mode_data["preferred_mode"]
+        test_time = bool(kwargs.get("test_time", True))
         result = await self.llm.generate_for_agent(
             request_uid=request_uid,
             message=input['task'],
@@ -179,7 +181,7 @@ class CopyMachine(Node):
             agent_id=self.id,
             agent_name=self.agent_name,
             agent_role=self.role,
-            test_time=True,
+            test_time=test_time,
             max_tokens=OUT_LENGTH
         )
         return input['task'], result

@@ -9,6 +9,7 @@ from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.scheduler_radix import RadixScheduler
 from nanovllm.engine.model_runner import ModelRunner
 
 
@@ -30,7 +31,10 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
+        if config.paged_backend == "radix":
+            self.scheduler = RadixScheduler(config)
+        else:
+            self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
     def exit(self):

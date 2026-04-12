@@ -46,9 +46,15 @@ class LLMRegistry:
         if paged is None:
             paged = os.environ.get("KVCOMM_PAGED", "0") == "1"
 
+        paged_backend = kwargs.get(
+            "paged_backend",
+            os.environ.get("KVCOMM_PAGED_BACKEND", "paged"),
+        )
+
         # PagedLLMChat doesn't use flash attention (nano-vllm handles its own attention);
         # strip the kwarg so it doesn't cause a TypeError.
         paged_kwargs = {k: v for k, v in kwargs.items() if k != "use_flash_attention"}
+        paged_kwargs.setdefault("paged_backend", paged_backend)
 
         if model_name == 'mock':
             model = cls.registry.get(model_name, **kwargs)
