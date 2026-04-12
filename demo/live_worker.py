@@ -21,6 +21,7 @@ Events (one JSON per line on stdout):
 
 import argparse
 import asyncio
+import base64
 import copy
 import json
 import os
@@ -31,13 +32,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-# Redirect all non-event output to stderr so stdout is clean JSON
 _real_stdout = sys.stdout
 sys.stdout = sys.stderr
 
-# Mutable state: tracks which mode_key is currently running,
-# so the metrics_recorder patch can tag agent_output events.
 _current_mode_key = {"value": ""}
+DEMO_AGENT_ROLES = [
+    "Math Solver",
+    "Mathematical Analyst",
+    "Programming Expert",
+]
 
 
 def emit(event: dict):
@@ -46,27 +49,43 @@ def emit(event: dict):
     _real_stdout.flush()
 
 
+def _activate_repo_root(repo_root: str | None) -> Path:
+    global REPO_ROOT
+    if repo_root:
+        REPO_ROOT = Path(repo_root).expanduser().resolve()
+    repo_root_str = str(REPO_ROOT)
+    sys.path = [repo_root_str] + [p for p in sys.path if p != repo_root_str]
+    return REPO_ROOT
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--question", type=str, required=True)
+    q_group = parser.add_mutually_exclusive_group(required=True)
+    q_group.add_argument("--question", type=str)
+    q_group.add_argument("--question-b64", type=str,
+                         help="Base64-encoded question (avoids shell quoting)")
     parser.add_argument("--tasks", type=str, required=True,
                         help='JSON list of {mode_key, execution_mode}')
     parser.add_argument("--backend", type=str, required=True,
-                        choices=["hf", "paged"])
+                        choices=["hf", "paged", "radix"])
     parser.add_argument("--model_path", type=str, default="")
     parser.add_argument("--gpu", type=int, default=None,
                         help="GPU index to use (sets CUDA_VISIBLE_DEVICES)")
     parser.add_argument("--nccl-port", type=int, default=None,
                         help="NCCL port for nano-vllm dist.init (avoids port conflict)")
-    return parser.parse_args()
+    parser.add_argument("--repo-root", type=str, default="")
+    args = parser.parse_args()
+    if args.question is None:
+        args.question = base64.b64decode(args.question_b64).decode("utf-8")
+    return args
 
 
 def patch_metrics_recorder():
-    """Monkey-patch metrics_recorder to emit JSON events on agent output.
-    Each event includes mode_key from _current_mode_key for precise routing."""
+    """Monkey-patch metrics_recorder to emit JSON events for the live demo."""
     from KVCOMM.utils.metrics import metrics_recorder
 
     original_record = metrics_recorder.record_agent_output.__func__
+    original_finalize = metrics_recorder.finalize_request.__func__
 
     def patched_record(self, *, request_uid, agent_id, agent_name,
                        agent_role, generation):
@@ -90,6 +109,25 @@ def patch_metrics_recorder():
         metrics_recorder, type(metrics_recorder)
     )
 
+    def patched_finalize(self, request_uid):
+        request_entry = self._requests.get(request_uid, {})
+        reuse_rate = original_finalize(self, request_uid)
+        emit({
+            "type": "request_reuse",
+            "mode_key": _current_mode_key["value"],
+            "request_uid": request_uid,
+            "execution_mode": request_entry.get("execution_mode"),
+            "reuse_rate": 0.0 if reuse_rate is None else reuse_rate,
+            "kv_reuse_count": request_entry.get("kv_reuse_count", 0),
+            "total_agents": request_entry.get("total_count", 0),
+            "task": request_entry.get("task"),
+        })
+        return reuse_rate
+
+    metrics_recorder.finalize_request = patched_finalize.__get__(
+        metrics_recorder, type(metrics_recorder)
+    )
+
 
 async def run_single_task(question: str, execution_mode: str, mode_key: str,
                           model_name: str):
@@ -98,7 +136,6 @@ async def run_single_task(question: str, execution_mode: str, mode_key: str,
     from KVCOMM.llm.config import KVCommConfig
     from KVCOMM.experiments.run_gsm8k import get_kwargs
 
-    # Set current mode_key so agent_output events are tagged correctly
     _current_mode_key["value"] = mode_key
 
     emit({
@@ -107,8 +144,9 @@ async def run_single_task(question: str, execution_mode: str, mode_key: str,
         "execution_mode": execution_mode,
     })
 
-    agent_names = ["MathSolver"] * 3
+    agent_names = ["MathSolver"] * len(DEMO_AGENT_ROLES)
     kwargs = get_kwargs("FullConnected", len(agent_names))
+    kwargs["node_kwargs"] = [{"role": role} for role in DEMO_AGENT_ROLES]
 
     kv_config = KVCommConfig.from_env()
     if execution_mode == "allow_kv_reuse":
@@ -127,8 +165,12 @@ async def run_single_task(question: str, execution_mode: str, mode_key: str,
     mode_kwargs = {}
     if execution_mode == "allow_kv_reuse":
         mode_kwargs["prefix"] = "Q:\n"
+        if "radix" in mode_key:
+            output_subdir = "live_demo_radix"
+        else:
+            output_subdir = "live_demo"
         mode_kwargs["output_dir"] = str(
-            REPO_ROOT / "KVCOMM" / "result" / "live_demo"
+            REPO_ROOT / "KVCOMM" / "result" / output_subdir
         )
 
     result = await graph.arun(
@@ -168,27 +210,26 @@ async def run_all_tasks(question: str, tasks: list, model_name: str):
 
 def main():
     args = parse_args()
+    _activate_repo_root(args.repo_root or None)
 
-    # Pin to a specific GPU if requested
     if args.gpu is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
-    # Set NCCL port for nano-vllm (avoid port conflicts between processes)
     if args.nccl_port is not None:
         os.environ["NANOVLLM_NCCL_PORT"] = str(args.nccl_port)
 
-    # Set backend env var BEFORE any KVCOMM imports
-    if args.backend == "paged":
+    if args.backend in ("paged", "radix"):
         os.environ["KVCOMM_PAGED"] = "1"
+        os.environ["KVCOMM_PAGED_BACKEND"] = "radix" if args.backend == "radix" else "paged"
     else:
         os.environ["KVCOMM_PAGED"] = "0"
+        os.environ.pop("KVCOMM_PAGED_BACKEND", None)
 
     tasks = json.loads(args.tasks)
 
     model_name = args.model_path or os.environ.get(
         "KVCOMM_MODEL",
-        "/usr/project/xtmp/yw641/hf_cache/hub/models--meta-llama--Llama-3.1-8B-Instruct"
-        "/snapshots/0e9e39f249a16976918f6564b8830bc894c89659",
+        "/home/users/yf199/workspace/hf_cache/Llama-3.1-8B-Instruct",
     )
 
     patch_metrics_recorder()

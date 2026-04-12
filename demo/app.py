@@ -1,11 +1,13 @@
 """
 KVCOMM Interactive Demo — Multi-Agent Math Solving Comparison
 
-Four execution modes displayed side-by-side:
-  1. KVCOMM  (Dense Prefill)      — HuggingFace backend, standard inference
-  2. KVCOMM  (KV Reuse)           — HuggingFace backend, cross-context KV reuse
-  3. PagedKVCOMM (Dense Prefill)  — nano-vllm paged backend, flash attention
-  4. PagedKVCOMM (KV Reuse)       — nano-vllm paged backend, KV reuse + flash attn
+Six execution modes displayed side-by-side:
+  1. KVCOMM Dense                 — HuggingFace backend, standard inference
+  2. KVCOMM KV Reuse             — HuggingFace backend, cross-context KV reuse
+  3. PagedKVCOMM Dense           — nano-vllm paged backend, flash attention
+  4. PagedKVCOMM KV Reuse        — nano-vllm paged backend, KV reuse + flash attn
+  5. Radix only                  — radix prefix matching
+  6. Radix KVCOMM                — revised(1) paged radix + KV reuse
 
 Usage:
   /usr/project/xtmp/yw641/envs/nano_vllm_a6000/bin/python3 demo/app.py [--port 7860] [--share]
@@ -51,47 +53,76 @@ ROLE_ICONS = {
     "FinalRefer": "\U0001f3af",            # 🎯
 }
 
-# The 4 demo modes
+CURRENT_REPO_ROOT = REPO_ROOT
+REVISED1_REPO_ROOT = Path("/home/users/hz314/workspace/PagedKVCOMM-revised(1)/PagedKVCOMM-revised")
+
+# The 6 demo modes
 MODE_DEFS = [
     {
         "key": "kvcomm_dense",
-        "label": "KVCOMM (Dense Prefill)",
+        "label": "KVCOMM Dense",
         "short": "HF Dense",
         "desc": "HuggingFace DynamicCache \u2014 full dense prefill, no KV reuse",
         "result_dir": "gsm8k_debug5_kvcomm",
         "latency_dir": "gsm8k_debug5_kvcomm",
         "backend": "HuggingFace DynamicCache",
+        "repo_root": str(CURRENT_REPO_ROOT),
         "color": "#4A90D9",
     },
     {
         "key": "kvcomm_reuse",
-        "label": "KVCOMM (KV Reuse)",
+        "label": "KVCOMM KV Reuse",
         "short": "HF KV-Reuse",
         "desc": "HuggingFace DynamicCache \u2014 cross-context anchor-based KV reuse",
         "result_dir": "gsm8k_debug5_kvcomm",
         "latency_dir": "gsm8k_debug5_kvcomm",
         "backend": "HuggingFace DynamicCache",
+        "repo_root": str(CURRENT_REPO_ROOT),
         "color": "#E6A23C",
     },
     {
         "key": "paged_dense",
-        "label": "PagedKVCOMM (Dense Prefill)",
+        "label": "PagedKVCOMM Dense",
         "short": "Paged Dense",
         "desc": "Paged Cache + flash attention \u2014 dense prefill",
         "result_dir": "gsm8k_debug5_paged",
         "latency_dir": "gsm8k_debug5_paged",
         "backend": "Paged Cache",
+        "repo_root": str(CURRENT_REPO_ROOT),
         "color": "#50B86C",
     },
     {
         "key": "paged_reuse",
-        "label": "PagedKVCOMM (KV Reuse)",
+        "label": "PagedKVCOMM KV Reuse",
         "short": "Paged KV-Reuse",
         "desc": "Paged Cache + flash attention \u2014 KV reuse",
         "result_dir": "gsm8k_debug5_paged",
         "latency_dir": "gsm8k_debug5_paged",
         "backend": "Paged Cache",
+        "repo_root": str(CURRENT_REPO_ROOT),
         "color": "#9B59B6",
+    },
+    {
+        "key": "radix_dense",
+        "label": "Radix only",
+        "short": "Radix only",
+        "desc": "Radix prefix cache \u2014 dense prefill",
+        "result_dir": "gsm8k_debug5_radix",
+        "latency_dir": "gsm8k_debug5_radix",
+        "backend": "Radix Cache",
+        "repo_root": str(CURRENT_REPO_ROOT),
+        "color": "#E57373",
+    },
+    {
+        "key": "paged_radix_kv_reuse",
+        "label": "Radix KVCOMM",
+        "short": "Radix KVCOMM",
+        "desc": "Paged Radix KV reuse from revised(1)",
+        "result_dir": "gsm8k_radix_kvcomm",
+        "latency_dir": "gsm8k_radix_kvcomm",
+        "backend": "Radix Cache + KV Reuse",
+        "repo_root": str(REVISED1_REPO_ROOT),
+        "color": "#EF5350",
     },
 ]
 
@@ -133,7 +164,7 @@ def _find_latest_result_file(result_dir: str) -> Optional[Path]:
 
 def load_all_data() -> Dict[str, Any]:
     """
-    Load result JSONs and latency JSONs for all 4 modes.
+    Load result JSONs and latency JSONs for all configured modes.
     Returns dict keyed by mode key -> {results: [...], latency: [...]}
     """
     data = {}
@@ -483,7 +514,7 @@ def build_metrics_table(panels: List[Dict]) -> str:
 # Main output builders (instant + streaming)
 # ---------------------------------------------------------------------------
 def build_all_panels(question: str):
-    """Build all 4 panels instantly. Returns 9-tuple (4 * (header, chat) + metrics)."""
+    """Build all panels instantly."""
     panels = [build_panel_data(md, question) for md in MODE_DEFS]
     outputs = []
     for p in panels:
@@ -513,8 +544,8 @@ def build_all_panels(question: str):
 def stream_all_panels(question: str):
     """
     Generator yielding incremental updates to simulate streaming.
-    Each yield is the same 9-tuple as build_all_panels.
-    Agents appear one by one across all 4 panels simultaneously.
+    Each yield mirrors build_all_panels().
+    Agents appear one by one across all panels simultaneously.
     """
     panels = [build_panel_data(md, question) for md in MODE_DEFS]
 
@@ -598,23 +629,21 @@ def stream_all_panels(question: str):
 # ---------------------------------------------------------------------------
 # Live Inference Engine (subprocess-based, parallel backends)
 # ---------------------------------------------------------------------------
-# Two backends run in PARALLEL, each as a separate subprocess.
+# Backends run in separate subprocesses.
 # Within each subprocess, dense + kv_reuse run sequentially (model loaded once).
-#
-#   ┌─ Subprocess 1 (HF,    KVCOMM_PAGED=0) ── kvcomm_dense ──→ kvcomm_reuse ─┐
-#   │                                                                           │ parallel
-#   └─ Subprocess 2 (Paged, KVCOMM_PAGED=1) ── paged_dense  ──→ paged_reuse ──┘
 #
 # If GPU memory is insufficient for two models, use --sequential mode.
 
 import subprocess
 
-# The 4 live inference tasks grouped by backend
+# Live inference tasks grouped by backend
 LIVE_TASKS = [
-    {"mode_key": "kvcomm_dense",  "backend": "hf",    "execution_mode": "default"},
-    {"mode_key": "kvcomm_reuse",  "backend": "hf",    "execution_mode": "allow_kv_reuse"},
-    {"mode_key": "paged_dense",   "backend": "paged", "execution_mode": "default"},
-    {"mode_key": "paged_reuse",   "backend": "paged", "execution_mode": "allow_kv_reuse"},
+    {"mode_key": "kvcomm_dense",  "backend": "hf",    "execution_mode": "default", "repo_root": str(CURRENT_REPO_ROOT)},
+    {"mode_key": "kvcomm_reuse",  "backend": "hf",    "execution_mode": "allow_kv_reuse", "repo_root": str(CURRENT_REPO_ROOT)},
+    {"mode_key": "paged_dense",   "backend": "paged", "execution_mode": "default", "repo_root": str(CURRENT_REPO_ROOT)},
+    {"mode_key": "paged_reuse",   "backend": "paged", "execution_mode": "allow_kv_reuse", "repo_root": str(CURRENT_REPO_ROOT)},
+    {"mode_key": "radix_dense",   "backend": "radix", "execution_mode": "default", "repo_root": str(CURRENT_REPO_ROOT)},
+    {"mode_key": "paged_radix_kv_reuse", "backend": "radix", "execution_mode": "allow_kv_reuse", "repo_root": str(REVISED1_REPO_ROOT)},
 ]
 
 WORKER_SCRIPT = str(Path(__file__).parent / "live_worker.py")
@@ -631,21 +660,16 @@ DEFAULT_MODEL = os.environ.get(
 
 class LiveEngine:
     """
-    Runs all 4 modes via separate subprocesses, each pinned to its own GPU.
+    Runs all modes via separate subprocesses, each pinned to a GPU when available.
 
     GPU assignment (--num-gpus N):
-      N >= 4: each mode gets its own GPU (full parallel)
-      N == 2: each backend shares a GPU, dense→reuse sequential within
+      N >= 3: each backend gets its own GPU (full parallel by backend)
+      N == 2: HF gets GPU0, paged/radix share GPU1 sequentially by backend
       N == 1: everything sequential on one GPU
 
     Paged (nano-vllm) subprocesses also get unique NCCL ports to avoid
     the "EADDRINUSE :2333" conflict.
     """
-
-    # GPU assignment per task index (mode_key order matches LIVE_TASKS)
-    # With 4 GPUs: task 0→GPU0, task 1→GPU1, task 2→GPU2, task 3→GPU3
-    # With 2 GPUs: HF tasks→GPU0, Paged tasks→GPU1
-    # With 1 GPU:  all→GPU0 (sequential)
 
     # Base NCCL port — each paged subprocess gets base + offset
     NCCL_PORT_BASE = 2333
@@ -656,7 +680,7 @@ class LiveEngine:
         self._num_gpus = num_gpus
 
     def _build_cmd(self, question: str, tasks: List[Dict], backend: str,
-                   gpu: Optional[int] = None, nccl_port: Optional[int] = None
+                   repo_root: str, gpu: Optional[int] = None, nccl_port: Optional[int] = None
                    ) -> List[str]:
         """Build the worker command line."""
         tasks_json = json.dumps(tasks)
@@ -665,6 +689,7 @@ class LiveEngine:
             "--question", question,
             "--tasks", tasks_json,
             "--backend", backend,
+            "--repo-root", repo_root,
             "--model_path", DEFAULT_MODEL,
         ]
         if gpu is not None:
@@ -674,13 +699,17 @@ class LiveEngine:
         return cmd
 
     def _run_subprocess(self, question: str, tasks: List[Dict],
-                        backend: str, gpu: Optional[int] = None,
+                        backend: str, repo_root: str, gpu: Optional[int] = None,
                         nccl_port: Optional[int] = None):
         """Run one subprocess. Blocks until done. Thread-safe via queue."""
-        cmd = self._build_cmd(question, tasks, backend, gpu, nccl_port)
+        cmd = self._build_cmd(question, tasks, backend, repo_root, gpu, nccl_port)
 
         env = os.environ.copy()
-        env["KVCOMM_PAGED"] = "1" if backend == "paged" else "0"
+        env["KVCOMM_PAGED"] = "1" if backend in ("paged", "radix") else "0"
+        if backend in ("paged", "radix"):
+            env["KVCOMM_PAGED_BACKEND"] = "radix" if backend == "radix" else "paged"
+        else:
+            env.pop("KVCOMM_PAGED_BACKEND", None)
         env["HF_HOME"] = os.environ.get(
             "HF_HOME", "/usr/project/xtmp/yw641/hf_cache"
         )
@@ -723,14 +752,23 @@ class LiveEngine:
     def _run_all(self, question: str):
         """Launch subprocesses with GPU assignment based on num_gpus."""
         try:
-            if self._num_gpus >= 4:
-                # 4 GPUs: each mode gets its own GPU, all parallel
+            backend_groups = {
+                (task["backend"], task.get("repo_root", str(CURRENT_REPO_ROOT))): [
+                    candidate for candidate in LIVE_TASKS
+                    if candidate["backend"] == task["backend"]
+                    and candidate.get("repo_root", str(CURRENT_REPO_ROOT)) == task.get("repo_root", str(CURRENT_REPO_ROOT))
+                ]
+                for task in LIVE_TASKS
+            }
+
+            if self._num_gpus >= len(backend_groups):
+                # Enough GPUs to run each backend group in parallel.
                 threads = []
-                for i, task in enumerate(LIVE_TASKS):
-                    nccl_port = self.NCCL_PORT_BASE + i if task["backend"] == "paged" else None
+                for i, ((backend, repo_root), tasks) in enumerate(backend_groups.items()):
+                    nccl_port = self.NCCL_PORT_BASE + i if backend in ("paged", "radix") else None
                     t = threading.Thread(
                         target=self._run_subprocess,
-                        args=(question, [task], task["backend"], i, nccl_port),
+                        args=(question, tasks, backend, repo_root, i, nccl_port),
                         daemon=True,
                     )
                     threads.append(t)
@@ -740,35 +778,53 @@ class LiveEngine:
                     t.join()
 
             elif self._num_gpus >= 2:
-                # 2 GPUs: HF→GPU0, Paged→GPU1, dense→reuse sequential within
-                hf_tasks = [t for t in LIVE_TASKS if t["backend"] == "hf"]
-                paged_tasks = [t for t in LIVE_TASKS if t["backend"] == "paged"]
-                threads = []
+                # GPU0 runs HF; GPU1 runs non-HF backends sequentially.
+                hf_groups = [
+                    ((backend, repo_root), tasks)
+                    for (backend, repo_root), tasks in backend_groups.items()
+                    if backend == "hf"
+                ]
+                hf_tasks = hf_groups[0][1] if hf_groups else []
+                hf_repo_root = hf_groups[0][0][1] if hf_groups else str(CURRENT_REPO_ROOT)
                 if hf_tasks:
-                    t = threading.Thread(
+                    hf_thread = threading.Thread(
                         target=self._run_subprocess,
-                        args=(question, hf_tasks, "hf", 0, None),
+                        args=(question, hf_tasks, "hf", hf_repo_root, 0, None),
                         daemon=True,
                     )
-                    threads.append(t)
-                if paged_tasks:
-                    t = threading.Thread(
-                        target=self._run_subprocess,
-                        args=(question, paged_tasks, "paged", 1, self.NCCL_PORT_BASE),
-                        daemon=True,
+                    hf_thread.start()
+                else:
+                    hf_thread = None
+
+                gpu1_groups = [
+                    ((backend, repo_root), tasks)
+                    for (backend, repo_root), tasks in backend_groups.items()
+                    if backend != "hf"
+                ]
+                for offset, ((backend, repo_root), tasks) in enumerate(gpu1_groups, start=1):
+                    self._run_subprocess(
+                        question,
+                        tasks,
+                        backend,
+                        repo_root,
+                        1,
+                        self.NCCL_PORT_BASE + offset,
                     )
-                    threads.append(t)
-                for t in threads:
-                    t.start()
-                for t in threads:
-                    t.join()
+
+                if hf_thread is not None:
+                    hf_thread.join()
 
             else:
                 # 1 GPU: fully sequential
                 for i, task in enumerate(LIVE_TASKS):
-                    nccl_port = self.NCCL_PORT_BASE + i if task["backend"] == "paged" else None
+                    nccl_port = self.NCCL_PORT_BASE + i if task["backend"] in ("paged", "radix") else None
                     self._run_subprocess(
-                        question, [task], task["backend"], 0, nccl_port
+                        question,
+                        [task],
+                        task["backend"],
+                        task.get("repo_root", str(CURRENT_REPO_ROOT)),
+                        0,
+                        nccl_port,
                     )
 
         finally:
@@ -796,20 +852,17 @@ live_engine = LiveEngine()
 
 def live_stream_panels(question: str):
     """
-    Generator that runs live inference for ALL 4 modes and yields UI updates.
+    Generator that runs live inference for all modes and yields UI updates.
     Each mode runs as a subprocess — no singleton conflicts.
-
-    Yields the same 9-tuple as build_all_panels:
-      4 x (header_html, chat_html) + metrics_html
     """
     if not question.strip():
         empty = "<p style='color:#585b70;'>Enter a question first</p>"
-        yield tuple([empty] * 9)
+        yield tuple([empty] * (2 * len(MODE_DEFS) + 1))
         return
 
     all_mode_keys = [t["mode_key"] for t in LIVE_TASKS]
 
-    # Live state for all 4 modes
+    # Live state for all modes
     live_state: Dict[str, Dict] = {}
     for mode_key in all_mode_keys:
         live_state[mode_key] = {
@@ -819,7 +872,7 @@ def live_stream_panels(question: str):
         }
 
     def _build_output():
-        """Build the 9-tuple from current state."""
+        """Build the UI output tuple from current state."""
         outputs = []
         all_panel_data = []
         for md in MODE_DEFS:
@@ -872,7 +925,7 @@ def live_stream_panels(question: str):
         outputs.append(build_metrics_table(all_panel_data))
         return tuple(outputs)
 
-    # Start all 4 modes
+    # Start all modes
     live_engine.run_inference(question)
     yield _build_output()
 
@@ -972,7 +1025,7 @@ def create_demo():
             KVCOMM: Multi-Agent Collaborative Math Solving
           </h1>
           <p style="color:#888; font-size:13px; margin:6px 0 0;">
-            Compare 4 execution modes: KVCOMM vs PagedKVCOMM &times; Dense Prefill vs KV Reuse
+            Compare 6 methods across HF, paged, radix, and revised paged-radix KV reuse
           </p>
         </div>
         """)
@@ -994,13 +1047,12 @@ def create_demo():
                 with gr.Row():
                     run_btn = gr.Button("Run Comparison", variant="primary", size="lg")
                     stream_btn = gr.Button("Stream (Animated)", variant="secondary", size="lg")
-                    live_btn = gr.Button("\u26a1 Live Inference (4 Modes Parallel)", variant="primary", size="lg")
+                    live_btn = gr.Button("\u26a1 Live Inference (6 Modes Parallel)", variant="primary", size="lg")
                 ground_truth = gr.HTML(
                     '<div style="color:#585b70; font-size:12px; padding:8px;">Select a problem to see ground truth</div>'
                 )
 
-        # 4 output panels in 2x2 grid
-        # Row 1: KVCOMM Dense | KVCOMM KV Reuse
+        # 6 output panels in a 3+3 layout
         with gr.Row():
             with gr.Column(scale=1, elem_classes="panel-col"):
                 p1_header = gr.HTML()
@@ -1008,21 +1060,27 @@ def create_demo():
             with gr.Column(scale=1, elem_classes="panel-col"):
                 p2_header = gr.HTML()
                 p2_chat = gr.HTML()
-
-        # Row 2: PagedKVCOMM Dense | PagedKVCOMM KV Reuse
-        with gr.Row():
             with gr.Column(scale=1, elem_classes="panel-col"):
                 p3_header = gr.HTML()
                 p3_chat = gr.HTML()
+
+        with gr.Row():
             with gr.Column(scale=1, elem_classes="panel-col"):
                 p4_header = gr.HTML()
                 p4_chat = gr.HTML()
+            with gr.Column(scale=1, elem_classes="panel-col"):
+                p5_header = gr.HTML()
+                p5_chat = gr.HTML()
+            with gr.Column(scale=1, elem_classes="panel-col"):
+                p6_header = gr.HTML()
+                p6_chat = gr.HTML()
 
         # Metrics
         metrics_output = gr.HTML()
 
         all_outputs = [p1_header, p1_chat, p2_header, p2_chat,
                        p3_header, p3_chat, p4_header, p4_chat,
+                       p5_header, p5_chat, p6_header, p6_chat,
                        metrics_output]
 
         # --- Event handlers ---
@@ -1051,7 +1109,7 @@ def create_demo():
         def on_run(question):
             if not question.strip():
                 empty = "<p style='color:#585b70;'>Enter a question first</p>"
-                return tuple([empty] * 9)
+                return tuple([empty] * len(all_outputs))
             return build_all_panels(question)
 
         run_btn.click(fn=on_run, inputs=[question_input], outputs=all_outputs)
@@ -1059,7 +1117,7 @@ def create_demo():
         def on_stream(question):
             if not question.strip():
                 empty = "<p style='color:#585b70;'>Enter a question first</p>"
-                yield tuple([empty] * 9)
+                yield tuple([empty] * len(all_outputs))
                 return
             yield from stream_all_panels(question)
 
@@ -1068,7 +1126,7 @@ def create_demo():
         def on_live(question):
             if not question.strip():
                 empty = "<p style='color:#585b70;'>Enter a question first</p>"
-                yield tuple([empty] * 9)
+                yield tuple([empty] * len(all_outputs))
                 return
             yield from live_stream_panels(question)
 
@@ -1089,8 +1147,8 @@ def main():
     parser.add_argument(
         "--num-gpus", type=int, default=4,
         help="Number of GPUs for live inference: "
-             "4 = each mode on its own GPU (full parallel); "
-             "2 = each backend on its own GPU; "
+             "3+ = each backend on its own GPU; "
+             "2 = HF on one GPU, paged/radix on the other; "
              "1 = sequential on one GPU",
     )
     args = parser.parse_args()
