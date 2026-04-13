@@ -1,0 +1,212 @@
+% =============================================================
+% CRS Ablation Study — LaTeX Tables & Method Description
+% Experiment: hf_crs_ablation_rtx_pro_10939241
+% Requires: \usepackage{booktabs, multirow, graphicx, pgfplots}
+% =============================================================
+
+% ----- Method Description -----
+\subsection{Cross-Round Sharing (CRS)}
+\label{sec:crs}
+
+In the standard KV-reuse pipeline, each agent must perform at least one
+dense prefill for every new user question before its KV cache can be
+reused by later requests.  Specifically, when an anchor entry exists for
+a given placeholder but the current agent has not yet stored its own
+context delta, the system forces a dense prefill to compute that delta.
+This creates a cold-start bottleneck: for the first occurrence of each
+input message, \emph{every} agent falls back to dense prefill regardless
+of available anchor history.
+
+Cross-Round Sharing (CRS) eliminates this bottleneck by allowing
+downstream agents (e.g., Agent~2, Agent~3, and the FinalRefer aggregator)
+to borrow the context delta computed by an upstream agent (Agent~1) that
+has already completed dense prefill for the same message within the
+current round.  When the \texttt{has\_active\_anchor} gate detects that
+(i)~an anchor entry exists, (ii)~the current agent lacks its own delta,
+and (iii)~an upstream agent's delta is available, CRS \emph{bypasses} the
+forced dense prefill and instead proceeds with KV reuse.  During the
+reuse phase, CRS applies a weighted cross-delta correction: using the
+upstream agent's stored key/value deltas and historical offset statistics,
+it estimates the offset that would have been obtained by a full dense
+prefill.  The correction weights are derived from the L2-norm similarity
+between the upstream delta and historical delta pairs across a sliding
+window.
+
+\subsubsection{Formulation}
+
+Each agent stores its anchor entries as an absolute delta from the
+rotated base cache.  For a shared token sequence $x$ at placeholder $p$,
+when Agent~1 (upstream) has already completed dense prefill this round:
+%
+\begin{equation}
+  \text{Agent 1 stores:}\quad \Delta_{\text{base}\to 1} = \mathrm{KV}(x \mid P_1) - \mathrm{KV}(x \mid \text{base})
+  \label{eq:crs-delta1}
+\end{equation}
+%
+\begin{equation}
+  \text{Agent 2 stores:}\quad \Delta_{\text{base}\to 2} = \mathrm{KV}(x \mid P_2) - \mathrm{KV}(x \mid \text{base})
+  \label{eq:crs-delta2}
+\end{equation}
+%
+Both deltas are already present in the anchor pool from prior requests.
+Agent~2 needs $\mathrm{KV}(x \mid P_2)$ for the \emph{current} input
+but has not yet run dense prefill, so its own
+$\Delta_{\text{base}\to 2}$ is unavailable this round.  CRS
+approximates it by rewriting:
+%
+\begin{equation}
+  \mathrm{KV}(x \mid P_2) = \mathrm{KV}(x \mid P_1) + \underbrace{\Delta_{\text{base}\to 2} - \Delta_{\text{base}\to 1}}_{\displaystyle \Delta_{1\to 2}}
+  \label{eq:crs-rewrite}
+\end{equation}
+%
+Since Agent~1's current-round cache $\mathrm{KV}(x \mid P_1)$ is
+available, the problem reduces to estimating the cross-agent correction
+$\Delta_{1\to 2}$.  We approximate it as a weighted average over $W$
+historical anchor entries where \emph{both} agents have stored deltas:
+%
+\begin{equation}
+  \Delta_{1 \to 2} \approx \sum_{i=1}^{W} w_i \bigl(\Delta_{\text{base}\to 2}^{(i)} - \Delta_{\text{base}\to 1}^{(i)}\bigr)
+  \label{eq:crs-cross}
+\end{equation}
+%
+The weights $w_i$ are computed from the L2 similarity between the
+current base key cache and each historical anchor's key embedding:
+%
+\begin{equation}
+  w_i = \frac{\exp\!\bigl(-\|K^{\text{base}} - K^{(i)}_{\text{emb}}\|_2\bigr)}{\sum_{j=1}^{W} \exp\!\bigl(-\|K^{\text{base}} - K^{(j)}_{\text{emb}}\|_2\bigr)}
+  \label{eq:crs-weights}
+\end{equation}
+%
+Substituting back, the final CRS estimate becomes:
+%
+\begin{equation}
+  \mathrm{KV}(x \mid P_2) \approx \mathrm{KV}(x \mid \text{base}) + \Delta_{\text{base}\to 1} - \sum_{i=1}^{W} w_i \bigl(\Delta_{\text{base}\to 1}^{(i)} - \Delta_{\text{base}\to 2}^{(i)}\bigr)
+  \label{eq:crs-final}
+\end{equation}
+%
+When no historical pairs exist ($W = 0$), the correction vanishes and
+CRS reduces to directly reusing Agent~1's delta.  The same procedure is
+applied independently to value caches.
+
+% ----- Experimental Setup Table -----
+\begin{table}[t]
+\centering
+\caption{Experimental setup for the CRS ablation study.}
+\label{tab:crs-setup}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{|l|l|}
+\hline
+\textbf{Parameter}        & \textbf{Value} \\
+\hline\hline
+Model                     & Llama-3.1-8B-Instruct \\
+\hline
+Benchmark                 & GSM8K (1{,}319 questions) \\
+\hline
+GPU                       & NVIDIA RTX PRO 6000 \\
+\hline
+Backend                   & HF (\texttt{gpt\_chat}) \\
+\hline
+Topology                  & FullConnected, 3$\times$MathSolver + FinalRefer \\
+\hline
+KV threshold              & 0.3 \\
+\hline
+Max anchors               & 20 \\
+\hline
+Window size               & 5 \\
+\hline
+Temperature               & 1.0 \\
+\hline
+Execution mode            & \texttt{allow\_kv\_reuse} \\
+\hline
+\end{tabular}
+\end{table}
+
+% ----- Main Results Table -----
+\begin{table}[t]
+\centering
+\caption{CRS ablation: KV reuse with and without Cross-Round Sharing.
+Both runs use the same code version and hyperparameters on the full
+GSM8K test set (1{,}319 questions).  The baseline disables CRS via
+\texttt{-{}-no-current-round-sharing}.}
+\label{tab:crs-results}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{|l|c|c|}
+\hline
+                          & \textbf{CRS OFF (Baseline)} & \textbf{CRS ON} \\
+\hline\hline
+Final Accuracy            & 0.8218                      & 0.7726 \\
+\hline
+KV Reuse Rate             & 70.2\%                      & 83.6\% \\
+\hline
+KV Reuse Calls            & 3{,}703 / 5{,}276           & 4{,}410 / 5{,}276 \\
+\hline
+CRS Bypass (dense$\to$reuse) & ---                      & 624 \\
+\hline
+Reuse Rate w/o CRS Bypass & ---                         & 71.8\% \\
+\hline
+\end{tabular}
+\end{table}
+
+% ----- Per-Node Accuracy Table -----
+\begin{table}[t]
+\centering
+\caption{Per-node accuracy and mode distribution for CRS OFF (baseline) vs.\ CRS ON.
+  Node~1 is the upstream agent and does not receive CRS corrections.}
+\label{tab:crs-per-node}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{|l|cc|cc|cc|}
+\hline
+                     & \multicolumn{2}{c|}{\textbf{Accuracy}} & \multicolumn{2}{c|}{\textbf{Dense Prefill}} & \multicolumn{2}{c}{\textbf{KV Reuse}} \\
+\cline{2-7}
+\textbf{Node (Role)} & OFF   & ON    & OFF & ON  & OFF & ON \\
+\hline\hline
+Node 1 (Math Solver)    & 77.26\% & 77.48\% & 280 & 258 & 1{,}039 & 1{,}061 \\
+\hline
+Node 2 (Math Analyst)   & 37.30\% & 39.04\% & 385 & 119 &   934 & 1{,}200 \\
+\hline
+Node 3 (Programmer)     & 74.45\% & 65.88\% & 405 & 161 &   914 & 1{,}158 \\
+\hline
+Node 0 (FinalRefer)     & 82.18\% & 77.26\% & 503 & 328 &   816 &   991 \\
+\hline
+\end{tabular}
+\end{table}
+
+% ----- CRS Applied vs Not — Accuracy Table -----
+\begin{table}[t]
+\centering
+\caption{Final accuracy (FinalRefer, model-evaluated) on questions where
+  CRS was applied vs.\ not (CRS~ON run, 1{,}319 questions).  CRS was
+  triggered on 228 questions that had upstream delta available.}
+\label{tab:crs-applied-vs-not}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{|l|c|c|c|}
+\hline
+                           & \textbf{CRS Applied}        & \textbf{No CRS}             & \textbf{$\Delta$} \\
+                           & (228 questions)              & (1{,}091 questions)         &                   \\
+\hline\hline
+FinalRefer Accuracy        & 80.70\%                      & 76.54\%                     & $+4.17$           \\
+\hline
+\end{tabular}
+\end{table}
+
+% ----- CRS Distribution by Node -----
+\begin{table}[t]
+\centering
+\caption{Distribution of CRS corrections across downstream nodes.
+  Node~1 serves as the upstream delta source and is never corrected.}
+\label{tab:crs-distribution}
+\renewcommand{\arraystretch}{1.15}
+\begin{tabular}{|l|c|}
+\hline
+\textbf{Target Node}  & \textbf{CRS Applied Count} \\
+\hline\hline
+Node 2 (Math Analyst)  & 228 \\
+\hline
+Node 3 (Programmer)    & 212 \\
+\hline
+Node 0 (FinalRefer)    & 184 \\
+\hline\hline
+\textbf{Total}         & \textbf{624} \\
+\hline
+\end{tabular}
+\end{table}

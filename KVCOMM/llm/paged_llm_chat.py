@@ -106,6 +106,11 @@ class PagedLLMChat(LLM):
     _paged_kv_engine: Optional[PagedKVCOMMEngine] = None
     _anchor_info_dict: Dict[str, Dict[str, int]] = {}
     _global_anchor_info_dict: Dict[str, Dict[str, List[int]]] = {}
+    # Mirrors HF's state.anchor_dict: stores the predict_as_anchor prob flag
+    # so has_active_anchor can distinguish "new anchor needing delta" from
+    # "existing anchor already handled".
+    # Keyed by request_uid -> ph_id -> message -> prob  (per-request, like HF).
+    _anchor_flag_dict: Dict[str, Dict[str, Dict[str, bool]]] = {}
     # Align with non-paged backend: default greedy decoding.
     DEFAULT_TEMPERATURE = 0.0
 
@@ -693,7 +698,13 @@ class PagedLLMChat(LLM):
                                 new_ph_k = new_ph_v = None
 
                 # ── Path 2: KVCOMM anchor matching (ph only, pf_num=0) ────────
-                if new_ph_k is None:
+                # NOTE: user_question is skipped here because nano-vllm stores K
+                # WITH RoPE pre-applied, so the paged delta gives the anchor's
+                # exact KV rather than an approximation (unlike HF which stores K
+                # without RoPE and re-applies it via _rotate_segment_caches).
+                # Until RoPE-aware delta approximation is implemented for paged,
+                # we fall back to dense prefill for user_question spans.
+                if new_ph_k is None and ph_id != "user_question":
                     anchor_msgs = [
                         m for m in self.paged_kv_engine.anchors.get(ph_id, {}).keys()
                         if m != message_key
@@ -1645,6 +1656,12 @@ class PagedLLMChat(LLM):
 
         message_key = self._message_cache_key(message)
 
+        # Store prob flag (mirrors HF's state.anchor_dict[ph_id][message] = prob)
+        req_flags = PagedLLMChat._anchor_flag_dict.setdefault(request_uid, {})
+        flag_bucket = req_flags.setdefault(anchor_namespace, {})
+        flag_bucket[message] = prob
+        flag_bucket[message_key] = prob
+
         if not prob:
             engine_info = self.paged_kv_engine.anchor_info.setdefault(anchor_namespace, {})
             for idx, anchor_msg_key in enumerate(anchor_messages):
@@ -1752,10 +1769,13 @@ class PagedLLMChat(LLM):
             "drop_num": drop_num,
         }
 
-        # Predict as anchor using blocks after drop_num
+        # Predict as anchor using blocks after drop_num.
+        # Account for intra-block offset: the condition content starts at
+        # drop_num % block_size within its first block.
         candidate_num = num_tokens - drop_num
         bs = self.paged_kv_engine.block_size
         candidate_start_block = drop_num // bs
+        candidate_intra = drop_num % bs
         candidate_blocks = block_table[candidate_start_block:]
 
         anchor_messages = list(self.paged_kv_engine.anchors.get(anchor_key, {}).keys())
@@ -1768,11 +1788,18 @@ class PagedLLMChat(LLM):
             top_p=0.9,
             entropy_threshold=self.config.threshold,
             max_compare_anchors=self.config.max_anchor_num,
+            candidate_start_intra=candidate_intra,
         )
 
         cond_info_bucket = PagedLLMChat._anchor_info_dict.setdefault(anchor_key, {})
         global_bucket = PagedLLMChat._global_anchor_info_dict.setdefault(anchor_key, {})
         message_key = self._message_cache_key(message)
+
+        # Store prob flag (mirrors HF's state.anchor_dict[anchor_key][message] = prob)
+        req_flags = PagedLLMChat._anchor_flag_dict.setdefault(request_uid, {})
+        flag_bucket = req_flags.setdefault(anchor_key, {})
+        flag_bucket[message] = prob
+        flag_bucket[message_key] = prob
 
         if not prob:
             engine_info = self.paged_kv_engine.anchor_info.setdefault(anchor_key, {})
@@ -1794,6 +1821,7 @@ class PagedLLMChat(LLM):
                     num_tokens=candidate_num,
                     max_anchor_num=self.config.max_anchor_num,
                     window_length=self.config.window_size,
+                    start_intra=candidate_intra,
                 )
                 if created:
                     safe_msg = _escape_loguru_markup(message)
@@ -1807,27 +1835,6 @@ class PagedLLMChat(LLM):
                         candidate_num,
                         len(candidate_blocks),
                     )
-                    # In paged mode, condition KV is injected via block references
-                    # (not per-agent delta). Store a zero-size stub delta for the
-                    # calling agent so has_active_anchor won't force dense_prefill
-                    # on every subsequent request. The stub is skipped in
-                    # apply_anchor_offset (ph_delta_num_tokens=0 < base_ph_num_tokens).
-                    with self.paged_kv_engine._lock:
-                        ph_store = self.paged_kv_engine.anchors.get(anchor_key, {})
-                        entry = ph_store.get(message)
-                        if entry is not None and self.node_id not in entry.agent_deltas:
-                            entry.agent_deltas[self.node_id] = {
-                                "ph_delta_blocks": [],
-                                "ph_delta_num_tokens": 0,
-                                "pf_delta_blocks": [],
-                                "pf_delta_num_tokens": 0,
-                            }
-                            logger.info(
-                                "[CONDITION_STUB_DELTA:paged] node={} ph_id={} message={} stored stub delta to prevent force_dense",
-                                getattr(self, "node_id", "?"),
-                                anchor_key,
-                                safe_msg,
-                            )
             cond_info_bucket[message] = 0
             cond_info_bucket[message_key] = 0
             global_bucket[message] = [0, candidate_num]
@@ -1850,60 +1857,66 @@ class PagedLLMChat(LLM):
             request_uid,
             ph_ids,
         )
+        req_flags = PagedLLMChat._anchor_flag_dict.get(request_uid, {})
         for ph_id in ph_ids:
+            # ── Step 1: check flag dict (same as HF's state.anchor_dict) ──
+            flag_bucket = req_flags.get(ph_id, {})
+            has_flag = flag_bucket.get(message) or flag_bucket.get(message_key)
+
+            # ── Step 2: check real delta (same as HF's node_id_ph_key_delta check) ──
             anchor_store = self.paged_kv_engine.anchors.get(ph_id, {})
-            has_message = (message in anchor_store) or (message_key in anchor_store)
-            if has_message:
-                # has_agent_delta is the hard gate: if this agent has not yet
-                # contributed delta for the active anchor entry, force dense prefill.
-                entry = anchor_store.get(message, anchor_store.get(message_key))
+            entry = anchor_store.get(message, anchor_store.get(message_key))
+            if entry is not None:
                 agent_deltas = getattr(entry, "agent_deltas", {})
-                has_agent_delta = self.node_id in agent_deltas
-                logger.info(
-                    "[ANCHOR_CHECK:paged] node={} ph_id={} has_message={} has_agent_delta={} -> force_dense={}",
-                    getattr(self, "node_id", "?"),
-                    ph_id,
-                    has_message,
-                    has_agent_delta,
-                    not has_agent_delta,
+                my_delta = agent_deltas.get(self.node_id)
+                has_delta = (
+                    my_delta is not None
+                    and int(my_delta.get("ph_delta_num_tokens", 0) or 0) > 0
                 )
-                if not has_agent_delta:
-                    cfg = getattr(self, "config", None)
-                    # crs_priority: always bypass dense_prefill for user_question (ablation).
-                    crs_prio = getattr(cfg, "crs_priority", False)
-                    if crs_prio and ph_id == "user_question":
-                        logger.info(
-                            "[ANCHOR_CHECK:paged] node={} ph_id={} "
-                            "crs_priority=True -> bypass dense_prefill (kv_reuse)",
-                            getattr(self, "node_id", "?"),
-                            ph_id,
-                        )
-                        continue
-                    # Before forcing dense_prefill, check if an upstream agent
-                    # already has a delta for this message in the current round.
-                    # If so, current-round sharing can approximate self's KV
-                    # (delta_self ≈ delta_upstream − cross_delta_historical),
-                    # so dense_prefill is not needed.
-                    crs_on = getattr(cfg, "use_current_round_sharing", True)
-                    has_upstream_delta = crs_on and any(
-                        aid != self.node_id for aid in agent_deltas
-                    )
-                    if has_upstream_delta:
-                        logger.info(
-                            "[ANCHOR_CHECK:paged] node={} ph_id={} "
-                            "has_upstream_delta=True -> allow kv_reuse (current-round sharing)",
-                            getattr(self, "node_id", "?"),
-                            ph_id,
-                        )
-                        continue  # don't force dense_prefill; fall through to return False
-                    return True
             else:
-                logger.info(
-                    "[ANCHOR_CHECK:paged] node={} ph_id={} has_message={} -> force_dense=False",
-                    getattr(self, "node_id", "?"),
-                    ph_id,
-                    has_message,
+                agent_deltas = {}
+                has_delta = False
+
+            force_dense = bool(has_flag is True and not has_delta)
+            logger.info(
+                "[ANCHOR_CHECK:paged] node={} ph_id={} has_flag={} has_delta={} -> force_dense={}",
+                getattr(self, "node_id", "?"),
+                ph_id,
+                bool(has_flag),
+                has_delta,
+                force_dense,
+            )
+
+            if has_flag is True and not has_delta:
+                cfg = getattr(self, "config", None)
+                # crs_priority: always bypass dense_prefill for user_question (ablation).
+                crs_prio = getattr(cfg, "crs_priority", False)
+                if crs_prio and ph_id == "user_question":
+                    logger.info(
+                        "[ANCHOR_CHECK:paged] node={} ph_id={} "
+                        "crs_priority=True -> bypass dense_prefill (kv_reuse)",
+                        getattr(self, "node_id", "?"),
+                        ph_id,
+                    )
+                    continue
+                # Before forcing dense_prefill, check if an upstream agent
+                # already has a delta for this message in the current round.
+                # If so, current-round sharing can approximate self's KV
+                # (delta_self ≈ delta_upstream − cross_delta_historical),
+                # so dense_prefill is not needed.
+                crs_on = getattr(cfg, "use_current_round_sharing", True)
+                has_upstream_delta = crs_on and any(
+                    aid != self.node_id for aid in agent_deltas
                 )
+                if has_upstream_delta:
+                    logger.info(
+                        "[ANCHOR_CHECK:paged] node={} ph_id={} "
+                        "has_upstream_delta=True -> allow kv_reuse (current-round sharing)",
+                        getattr(self, "node_id", "?"),
+                        ph_id,
+                    )
+                    continue  # don't force dense_prefill; fall through to return False
+                return True
         logger.info(
             "[ANCHOR_CHECK:paged] node={} request_uid={} force_dense=False (no active anchor)",
             getattr(self, "node_id", "?"),
@@ -1918,8 +1931,8 @@ class PagedLLMChat(LLM):
         For the paged backend, this frees any request-scoped block references.
         """
         # In paged mode, blocks are ref-counted and freed via block_manager.
-        # Per-request state is minimal; clear any cached data.
-        pass
+        # Clean up per-request anchor flag state (mirrors HF state lifecycle).
+        cls._anchor_flag_dict.pop(request_uid, None)
 
     def _map_in_pool(self, fn, iterable, timeout=None):
         """Execute fn(args) for each args in iterable using the shared thread pool."""

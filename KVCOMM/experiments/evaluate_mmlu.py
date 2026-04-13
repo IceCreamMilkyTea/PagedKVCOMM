@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterator, List, Optional
 from tqdm import tqdm
 
 from KVCOMM.graph.graph import Graph
-from experiments.accuracy import Accuracy
+from KVCOMM.experiments.accuracy import Accuracy
 from KVCOMM.utils.log import logger
 from KVCOMM.utils.metrics import metrics_recorder
 

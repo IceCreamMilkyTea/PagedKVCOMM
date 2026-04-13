@@ -18,7 +18,7 @@ from KVCOMM.graph.graph import Graph
 from KVCOMM.llm.config import KVCommConfig
 from datasets.MMLU.download import download
 from datasets.mmlu_dataset import MMLUDataset
-from experiments.evaluate_mmlu import evaluate
+from KVCOMM.experiments.evaluate_mmlu import evaluate
 from KVCOMM.utils.log import configure_logging, logger
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +68,13 @@ def parse_args():
     parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
+    parser.add_argument("--use-flash-attention", action="store_true", help="Use Flash Attention 2 for LLMChat backend.")
+    parser.add_argument("--use-local-reference", action="store_true", help="Use upstream agent KV as local reference for inner-round offset.")
+    parser.add_argument("--local-ref-mode", type=str, default=None, choices=["no_check", "cross_delta_consistency", "weight_confidence"], help="Similarity gate mode for local reference.")
+    parser.add_argument("--local-ref-consistency-threshold", type=float, default=None, help="Max relative std for cross_delta_consistency gate.")
+    parser.add_argument("--local-ref-weight-threshold", type=float, default=None, help="Min max-weight for weight_confidence gate.")
+    parser.add_argument("--no-current-round-sharing", action="store_true", help="Disable current-round KV sharing (ablation baseline).")
+    parser.add_argument("--crs-priority", action="store_true", help="Bypass dense_prefill for user_question anchors even without own delta (CRS priority ablation).")
 
     args = parser.parse_args()
     result_path = Path(args.output_dir)
@@ -83,13 +90,27 @@ async def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(args.mode, len(agent_names))
-    kv_config = KVCommConfig.from_env().apply_overrides(
-        threshold=args.kv_threshold,
-        max_anchor_num=args.kv_max_anchor_num,
-        window_size=args.kv_window_size,
-        thread_pool_workers=args.kv_thread_workers,
-        worker_timeout=args.kv_worker_timeout,
-    )
+
+    logger.info("[CONFIG] Model: {}, Mode: {}, Execution: {}, Flash Attention: {}, CRS Priority: {}",
+                args.llm_name, args.mode, args.execution_mode, args.use_flash_attention,
+                getattr(args, "crs_priority", False))
+
+    if args.execution_mode == "allow_kv_reuse":
+        kv_config = KVCommConfig.from_env().apply_overrides(
+            threshold=args.kv_threshold,
+            max_anchor_num=args.kv_max_anchor_num,
+            window_size=args.kv_window_size,
+            thread_pool_workers=args.kv_thread_workers,
+            worker_timeout=args.kv_worker_timeout,
+            use_local_reference=args.use_local_reference or None,
+            local_ref_mode=args.local_ref_mode,
+            local_ref_consistency_threshold=args.local_ref_consistency_threshold,
+            local_ref_weight_threshold=args.local_ref_weight_threshold,
+            use_current_round_sharing=not args.no_current_round_sharing,
+            crs_priority=args.crs_priority or None,
+        )
+    else:
+        kv_config = KVCommConfig.from_env()
 
     graph = Graph(
         domain=args.domain,
@@ -97,6 +118,7 @@ async def main():
         agent_names=agent_names,
         decision_method=args.decision_method,
         kv_config=kv_config,
+        use_flash_attention=args.use_flash_attention,
         **kwargs,
     )
 
@@ -121,7 +143,8 @@ async def main():
         **eval_kwargs,
     )
     logger.opt(colors=True).info("<blue>[MMLU SCORE]</blue> {:.4f}", score)
-    result_file = output_dir / f"{args.domain}_{args.llm_name}_{timestamp}.json"
+    model_name = Path(args.llm_name).name
+    result_file = output_dir / f"{args.domain}_{model_name}_{timestamp}.json"
     result_file.touch(exist_ok=True)
     payload = {
         "score": score,

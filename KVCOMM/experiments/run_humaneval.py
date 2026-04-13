@@ -86,6 +86,13 @@ def parse_args():
     parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
+    parser.add_argument("--use-flash-attention", action="store_true", help="Use Flash Attention 2 for LLMChat backend.")
+    parser.add_argument("--use-local-reference", action="store_true", help="Use upstream agent KV as local reference for inner-round offset.")
+    parser.add_argument("--local-ref-mode", type=str, default=None, choices=["no_check", "cross_delta_consistency", "weight_confidence"], help="Similarity gate mode for local reference.")
+    parser.add_argument("--local-ref-consistency-threshold", type=float, default=None, help="Max relative std for cross_delta_consistency gate.")
+    parser.add_argument("--local-ref-weight-threshold", type=float, default=None, help="Min max-weight for weight_confidence gate.")
+    parser.add_argument("--no-current-round-sharing", action="store_true", help="Disable current-round KV sharing (ablation baseline).")
+    parser.add_argument("--crs-priority", action="store_true", help="Bypass dense_prefill for user_question anchors even without own delta (CRS priority ablation).")
 
     args = parser.parse_args()
     if len(args.agent_names) != len(args.agent_nums):
@@ -108,6 +115,10 @@ async def main():
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(args.mode, len(agent_names))
 
+    logger.info("[CONFIG] Model: {}, Mode: {}, Execution: {}, Flash Attention: {}, CRS Priority: {}",
+                args.llm_name, args.mode, args.execution_mode, args.use_flash_attention,
+                getattr(args, "crs_priority", False))
+
     kv_config: Optional[KVCommConfig] = None
     if args.execution_mode == "allow_kv_reuse":
         kv_config = KVCommConfig.from_env().apply_overrides(
@@ -116,6 +127,12 @@ async def main():
             window_size=args.kv_window_size,
             thread_pool_workers=args.kv_thread_workers,
             worker_timeout=args.kv_worker_timeout,
+            use_local_reference=args.use_local_reference or None,
+            local_ref_mode=args.local_ref_mode,
+            local_ref_consistency_threshold=args.local_ref_consistency_threshold,
+            local_ref_weight_threshold=args.local_ref_weight_threshold,
+            use_current_round_sharing=not args.no_current_round_sharing,
+            crs_priority=args.crs_priority or None,
         )
     else:
         kv_config = KVCommConfig.from_env()
@@ -126,11 +143,14 @@ async def main():
         agent_names=agent_names,
         decision_method=args.decision_method,
         kv_config=kv_config,
+        use_flash_attention=args.use_flash_attention,
         **kwargs,
     )
 
     num_batches = int(len(dataset) / args.batch_size)
     total_solved, total_executed = 0, 0
+    node_solved: dict = {}
+    node_executed: dict = {}
 
     for i_batch in range(num_batches):
         logger.opt(colors=True).info(f"<blue>[BATCH]</blue> {i_batch} {'-' * 40}")
@@ -171,6 +191,7 @@ async def main():
 
         batch_results = await asyncio.gather(*tasks)
         results_by_task = {result.get("task"): result.get("answers", []) for result in batch_results}
+        node_outputs_by_task = {result.get("task"): result.get("node_outputs", {}) for result in batch_results}
         data = load_result(result_file)
 
         for info in meta_info:
@@ -211,6 +232,30 @@ async def main():
             f"<blue>[BATCH TIME]</blue> {time.time() - start_ts:.3f}s"
         )
         logger.opt(colors=True).info(f"<blue>[ACCURACY]</blue> {accuracy:.4f}")
+
+        # Per-node accuracy
+        if args.execution_mode == "allow_kv_reuse":
+            for info in meta_info:
+                task = info["task"]
+                tests = info["tests"]
+                node_outs = node_outputs_by_task.get(task, {})
+                for node_id, outputs in sorted(node_outs.items()):
+                    node_solved.setdefault(node_id, 0)
+                    node_executed.setdefault(node_id, 0)
+                    text = outputs[0] if outputs else ""
+                    if isinstance(text, str):
+                        code = text.split("```python\n")[-1].split("\n```")[0]
+                    else:
+                        code = str(text)
+                    ok, _, _ = PyExecutor().execute(code, [tests], timeout=100)
+                    node_solved[node_id] += ok
+                    node_executed[node_id] += 1
+            node_acc_str = "  ".join(
+                f"node={nid}: {node_solved[nid]/node_executed[nid]:.4f}"
+                for nid in sorted(node_solved)
+            )
+            logger.opt(colors=True).info(f"<yellow>[NODE_ACCURACY]</yellow> {node_acc_str}")
+
         metrics_recorder.log_cumulative(batch_index=i_batch)
 
 def get_kwargs(

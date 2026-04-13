@@ -1404,13 +1404,13 @@ class LLMChat(LLM):
         prefix_kv_list: List[DynamicCache] = prefix_store.get("prefix", [])
         prefix_token_ids: List[Dict[str, torch.Tensor]] = prefix_store.get("token_ids", [])
         placeholder_info_map = prefix_store.get("placeholder_info")
-        
+
         dprint("PREFIX_STORE",
             "prefix_store=", prefix_store,
             "prefix_kv_list=", len(prefix_kv_list),
             "prefix_token_ids=", len(prefix_token_ids),
             "placeholders=", list(placeholder_info_map.keys()) if placeholder_info_map else None)
-                    
+
         if not prefix_kv_list:
             raise RuntimeError(
                 "No prefix KV found in shared memory. Make sure you've called prepare_prefix_kv_segments or init_shared_placeholder_prefix_kv."
@@ -1442,11 +1442,7 @@ class LLMChat(LLM):
             
             ph_cache_seq_len = _cache_seq_len(ph_cache)
             ph_ids_len = ph_cache_ids["input_ids"].shape[-1] if ph_cache_ids else 0
-            # print(
-            #     f"[CACHE_READ] mode={mode}, ph_id={ph_id}, message_hash={hash(message)}, message_preview={_preview_message(message)}, ph_content_preview={ph_content_preview}, ph_cache_seq_len={ph_cache_seq_len}, ph_ids_len={ph_ids_len}, drop_num={drop_num}, real_len={real_len}",
-            #     flush=True,
-            # )
-            
+
             meta.append(
                 {
                     "idx": idx,
@@ -1500,10 +1496,6 @@ class LLMChat(LLM):
                     else 0
                 )
                 seg_content_preview = _preview_token_ids(self.tokenizer, seg_ids)
-                # print(
-                #     f"[CACHE_REUSE_APPLY] ph_id={ph_id}, message_hash={hash(message)}, message_preview={_preview_message(message)}, seg_content_preview={seg_content_preview}, seg_cache_seq_len={seg_len}, seg_ids_len={seg_ids_len}",
-                #     flush=True,
-                # )
 
         placeholder_indices: Dict[str, Tuple[int, int]] = {}
         for m in meta:
@@ -1513,7 +1505,7 @@ class LLMChat(LLM):
                 start + _cache_seq_len(m["ph_cache"]) - m["drop_num"],
             )
         # template merging: s^(t)_m = [ p_{m,0}, φ^(t)_{m,1}, p_{m,1}, φ^(t)_{m,2}, p_{m,2}, ..., φ^(t)_{m,i}, p_{m,i}]
-        
+
         seg_cache_list = [r[1] for r in results_sorted]
         merged_prefix_kv.concat_(seg_cache_list)
         seg_ids_list = [r[2] for r in results_sorted]
@@ -1744,7 +1736,8 @@ class LLMChat(LLM):
             raise ValueError("request_uid must be provided for agen_kvcomm.")
         min_tokens = max_tokens if min_tokens is None else min_tokens
         state = self.kv_engine.resolve_request_state(request_uid)
-        preprocess_start = perf_counter() if mode == "kv_reuse" else None
+        _profile = mode == "kv_reuse"
+        preprocess_start = perf_counter() if _profile else None
 
         if isinstance(messages, List):
             message = messages[0]
@@ -1762,8 +1755,16 @@ class LLMChat(LLM):
         if placeholder_info_map is None:
             raise RuntimeError("placeholder_info missing in shared KV cache memory.")
 
+        if _profile:
+            torch.cuda.synchronize()
+            _pt0 = perf_counter()
+
         merged_prefix_kv = prefix_kv_list[0].copy()
         merged_prefix_token_ids = prefix_token_ids[0].copy()
+
+        if _profile:
+            torch.cuda.synchronize()
+            _pt_copy = perf_counter()
 
         placeholder_entries = list(placeholder_info_map.items())[::-1]
 
@@ -1799,6 +1800,10 @@ class LLMChat(LLM):
             ph_cum_len += real_len
             ph_id_list.append(ph_id)
 
+        if _profile:
+            torch.cuda.synchronize()
+            _pt_fetch = perf_counter()
+
         if mode == "dense_prefill":
             tasks = [(message, m) for m in meta]
             results = list(
@@ -1821,6 +1826,10 @@ class LLMChat(LLM):
 
         results_sorted = sorted(results, key=lambda x: x[0])
 
+        if _profile:
+            torch.cuda.synchronize()
+            _pt_seg = perf_counter()
+
         placeholder_indices: Dict[str, Tuple[int, int]] = {}
         for m in meta:
             start = m["start"] + m["offset_before"]
@@ -1831,6 +1840,11 @@ class LLMChat(LLM):
 
         seg_cache_list = [r[1] for r in results_sorted]
         merged_prefix_kv.concat_(seg_cache_list)
+
+        if _profile:
+            torch.cuda.synchronize()
+            _pt_concat = perf_counter()
+
         seg_ids_list = [r[2] for r in results_sorted]
         merged_prefix_token_ids = concat_(merged_prefix_token_ids, seg_ids_list)
 
@@ -1861,6 +1875,19 @@ class LLMChat(LLM):
         if mode == "kv_reuse":
             merged_prefix_kv = merged_prefix_kv.slice_(start=0, end=prefix_token_length - 1)
             generation_kwargs["past_key_values"] = merged_prefix_kv
+
+        if _profile:
+            torch.cuda.synchronize()
+            _pt_slice = perf_counter()
+            logger.opt(colors=True).info(
+                f"<yellow>[PROFILE_PREPROCESS] node={self.node_id} role={self.role} | "
+                f"copy={_pt_copy - _pt0:.4f}s | "
+                f"fetch_shared={_pt_fetch - _pt_copy:.4f}s | "
+                f"update_kv_seg={_pt_seg - _pt_fetch:.4f}s | "
+                f"concat={_pt_concat - _pt_seg:.4f}s | "
+                f"slice={_pt_slice - _pt_concat:.4f}s | "
+                f"total_preprocess={_pt_slice - _pt0:.4f}s</yellow>"
+            )
 
         preprocess_latency = 0.0
         if preprocess_start is not None:

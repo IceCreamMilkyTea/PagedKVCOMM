@@ -18,10 +18,11 @@ class FinalWriteCode(Node):
         domain: str = "",
         llm_name: str = "",
         llm_config: KVCommConfig | None = None,
+        use_flash_attention: bool = False,
     ):
         super().__init__(id, "FinalWriteCode" ,domain, llm_name)
         prefix = ""
-        self.llm = LLMRegistry.get(llm_name, prefix=prefix, llm_config=llm_config)
+        self.llm = LLMRegistry.get(llm_name, prefix=prefix, llm_config=llm_config, use_flash_attention=use_flash_attention)
         self.role = 'FinalWriteCode'
         self.llm.set_id(self.id, 'FinalWriteCode')
         self.prompt_set = PromptSetRegistry.get(domain)
@@ -602,7 +603,7 @@ class FinalRefer(Node):
 
 @AgentRegistry.register('FinalDirect')
 class FinalDirect(Node):
-    def __init__(self, id: str | None =None,  domain: str = "", llm_name: str = "",):
+    def __init__(self, id: str | None =None,  domain: str = "", llm_name: str = "", **kwargs):
         """ Used for Directed IO """
         super().__init__(id, "FinalDirect")
         self.prompt_set = PromptSetRegistry.get(domain)
@@ -639,7 +640,7 @@ class FinalDirect(Node):
 
 @AgentRegistry.register('FinalMajorVote')
 class FinalMajorVote(Node):
-    def __init__(self, id: str | None =None,  domain: str = "", llm_name: str = "",):
+    def __init__(self, id: str | None =None,  domain: str = "", llm_name: str = "", **kwargs):
         """ Used for Directed IO """
         super().__init__(id, "FinalMajorVote")
         self.prompt_set = PromptSetRegistry.get(domain)

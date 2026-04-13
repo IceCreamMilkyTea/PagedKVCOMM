@@ -279,11 +279,17 @@ class PagedKVCOMMEngine:
         num_tokens: int,
         max_anchor_num: int = 20,
         window_length: int = 5,
+        start_intra: int = 0,
     ) -> bool:
         """Register a base anchor entry directly from existing blocks.
 
         This is used to bootstrap anchor history before dense set_anchor paths
         become available for a placeholder.
+
+        Args:
+            start_intra: Intra-block token offset. When the content does not
+                start at position 0 of the first block, pass the offset so the
+                correct slice is stored as the embedding.
 
         Returns:
             True if a new anchor entry was created, False otherwise.
@@ -291,7 +297,12 @@ class PagedKVCOMMEngine:
         if num_tokens <= 0 or not block_table:
             return False
 
-        ph_key, ph_val = self.read_kv_from_blocks(block_table, num_tokens)
+        if start_intra > 0:
+            full_k, full_v = self.read_kv_from_blocks(block_table, start_intra + num_tokens)
+            ph_key = full_k[..., start_intra:start_intra + num_tokens, :]
+            ph_val = full_v[..., start_intra:start_intra + num_tokens, :]
+        else:
+            ph_key, ph_val = self.read_kv_from_blocks(block_table, num_tokens)
 
         with self._lock:
             ph_store = self.anchors.setdefault(ph_id, {})
@@ -803,6 +814,7 @@ class PagedKVCOMMEngine:
         entropy_threshold: float = 0.5,
         max_compare_anchors: int = 64,
         use_response_embeddings: bool = False,
+        candidate_start_intra: int = 0,
     ) -> Tuple[bool, List[int]]:
         """Decide whether to activate anchors based on KV similarity.
 
@@ -904,7 +916,13 @@ class PagedKVCOMMEngine:
                 )
                 return True, activated
 
-            _, cand_val = self.read_kv_from_blocks(candidate_block_table, candidate_num_tokens)
+            if candidate_start_intra > 0:
+                _, _full = self.read_kv_from_blocks(
+                    candidate_block_table, candidate_start_intra + candidate_num_tokens
+                )
+                cand_val = _full[..., candidate_start_intra:candidate_start_intra + candidate_num_tokens, :]
+            else:
+                _, cand_val = self.read_kv_from_blocks(candidate_block_table, candidate_num_tokens)
 
             diff_list = []
             for entry in available_entries:
