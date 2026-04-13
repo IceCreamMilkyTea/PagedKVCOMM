@@ -1706,6 +1706,30 @@ class PagedLLMChat(LLM):
         global_bucket[message] = [0, candidate_num]
         global_bucket[message_key] = [0, candidate_num]
         if prob:
+            # CRS bypass (mirrors HF update_input_anchor lines 831-848):
+            # If an upstream agent already has a delta for this anchor,
+            # kv_reuse + CRS offset is sufficient — override to kv_reuse.
+            cfg = getattr(self, "config", None)
+            crs_on = getattr(cfg, "use_current_round_sharing", True)
+            if crs_on and anchor_namespace == "user_question":
+                anchor_store = self.paged_kv_engine.anchors.get(anchor_namespace, {})
+                entry = anchor_store.get(message, anchor_store.get(message_key))
+                if entry is not None:
+                    agent_deltas = getattr(entry, "agent_deltas", {})
+                    has_upstream = any(
+                        aid != self.node_id for aid in agent_deltas
+                    )
+                    if has_upstream:
+                        logger.info(
+                            "[UPDATE_INPUT_ANCHOR:paged] node={} ph_id={} "
+                            "has_upstream_delta=True -> override to kv_reuse (CRS)",
+                            getattr(self, "node_id", "?"),
+                            anchor_namespace,
+                        )
+                        # Reset flag so has_active_anchor won't force dense either
+                        flag_bucket[message] = False
+                        flag_bucket[message_key] = False
+                        return "kv_reuse"
             return "dense_prefill"
         return "kv_reuse"
 
